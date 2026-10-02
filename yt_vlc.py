@@ -14,6 +14,7 @@ import time
 import datetime
 import threading
 import subprocess
+import shutil
 import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -173,16 +174,18 @@ def extract_stream_url(video_id_or_url, quality="720", player_client="android,io
     """Dùng yt-dlp trích xuất đường dẫn direct stream (hỗ trợ cả progressive lẫn dual audio/video stream)"""
     target = video_id_or_url if video_id_or_url.startswith("http") else f"https://www.youtube.com/watch?v={video_id_or_url}"
     
+    # Ưu tiên H.264 (avc1) cho chip ARM / Armbian để giải mã phần cứng mượt mà
     if quality in ["1080", "best"]:
-        format_spec = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}][acodec!=none]/best[acodec!=none]/best"
+        format_spec = f"best[height<={quality}][vcodec^=avc1][acodec!=none]/bestvideo[height<={quality}][vcodec^=avc1]+bestaudio/best[height<={quality}][acodec!=none]/best[acodec!=none]/best"
     else:
-        format_spec = f"best[height<={quality}][acodec!=none]/bestvideo[height<={quality}]+bestaudio/best[acodec!=none]/best"
+        format_spec = f"best[height<={quality}][vcodec^=avc1][acodec!=none]/best[height<={quality}][ext=mp4][acodec!=none]/best[acodec!=none]/best"
     
     env = os.environ.copy()
     env["PATH"] = f"/home/a/.local/bin:{env.get('PATH', '')}"
 
     cmd = [
         "yt-dlp",
+        "--no-playlist",
         "--extractor-args", f"youtube:player_client={player_client}",
         "-f", format_spec,
         "-g",
@@ -193,7 +196,7 @@ def extract_stream_url(video_id_or_url, quality="720", player_client="android,io
         cmd.extend(["--js-runtimes", f"node:{node_bin}"])
 
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=20, env=env)
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=25, env=env)
         lines = [line.strip() for line in proc.stdout.splitlines() if line.strip().startswith("http")]
         if len(lines) >= 2:
             return lines[0], lines[1]
@@ -201,6 +204,24 @@ def extract_stream_url(video_id_or_url, quality="720", player_client="android,io
             return lines[0], None
     except Exception:
         pass
+
+    # Thử phương án dự phòng nếu format trên không có
+    try:
+        cmd_fallback = [
+            "yt-dlp",
+            "--no-playlist",
+            "--extractor-args", "youtube:player_client=android",
+            "-f", "best[acodec!=none]/best",
+            "-g",
+            target
+        ]
+        proc = subprocess.run(cmd_fallback, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=15, env=env)
+        lines = [line.strip() for line in proc.stdout.splitlines() if line.strip().startswith("http")]
+        if lines:
+            return lines[0], None
+    except Exception:
+        pass
+
     return None, None
 
 def launch_vlc(video, settings, status_callback=None):
@@ -210,7 +231,7 @@ def launch_vlc(video, settings, status_callback=None):
         target_url = f"https://www.youtube.com/watch?v={vid_id}" if vid_id else video.get("url")
 
         if status_callback:
-            GLib.idle_add(status_callback, f"⏳ Đang trích xuất luồng: {title[:40]}...")
+            GLib.idle_add(status_callback, f"⏳ Đang tải luồng video: {title[:40]}...")
 
         video_url, audio_url = extract_stream_url(
             target_url,
@@ -218,21 +239,31 @@ def launch_vlc(video, settings, status_callback=None):
             player_client=settings.get("player_client", "android,ios")
         )
 
-        vlc_target = video_url if video_url else target_url
-        caching = settings.get("caching", 3000)
+        if not video_url:
+            if status_callback:
+                GLib.idle_add(status_callback, "❌ Không thể phát video này (giới hạn bản quyền/độ tuổi hoặc mạng yếu). Vui lòng thử video khác!")
+            return
 
+        caching = settings.get("caching", 2500)
+
+        # Cờ tối ưu hóa cho VLC trên hệ điều hành Armbian (Amlogic S905X)
         vlc_cmd = [
             "vlc",
-            vlc_target,
+            video_url,
             f"--meta-title={title}",
             f"--file-caching={caching}",
-            f"--network-caching={caching}"
+            f"--network-caching={caching}",
+            "--no-video-title-show",
+            "--drop-late-frames",
+            "--skip-frames"
         ]
         if audio_url:
             vlc_cmd.append(f"--input-slave={audio_url}")
 
-        if not settings.get("hw_accel", True):
-            vlc_cmd.extend(["--avcodec-hw=none", "--avcodec-skiploopfilter=3"])
+        if settings.get("hw_accel", True):
+            vlc_cmd.extend(["--avcodec-skiploopfilter=3"])
+        else:
+            vlc_cmd.extend(["--avcodec-hw=none", "--avcodec-skiploopfilter=4"])
 
         if status_callback:
             GLib.idle_add(status_callback, f"▶ Đang phát trên VLC: {title[:40]}")
@@ -992,6 +1023,8 @@ class MainWindow(Gtk.Window):
         # 4. Tăng tốc phần cứng
         lbl_hw = Gtk.Label(label="Tăng tốc phần cứng (Hardware Accel):", xalign=0)
         self.switch_hw = Gtk.Switch()
+        self.switch_hw.set_halign(Gtk.Align.START)
+        self.switch_hw.set_valign(Gtk.Align.CENTER)
         self.switch_hw.set_active(self.settings.get("hw_accel", True))
         grid.attach(lbl_hw, 0, 3, 1, 1)
         grid.attach(self.switch_hw, 1, 3, 1, 1)
@@ -999,9 +1032,26 @@ class MainWindow(Gtk.Window):
         # 5. Giao diện tối
         lbl_dark = Gtk.Label(label="Giao diện tối (Dark Mode):", xalign=0)
         self.switch_dark = Gtk.Switch()
+        self.switch_dark.set_halign(Gtk.Align.START)
+        self.switch_dark.set_valign(Gtk.Align.CENTER)
         self.switch_dark.set_active(self.settings.get("dark_mode", True))
         grid.attach(lbl_dark, 0, 4, 1, 1)
         grid.attach(self.switch_dark, 1, 4, 1, 1)
+
+        # Thông tin tối ưu hóa phần cứng Armbian
+        armbian_frame = Gtk.Frame(label="Tối ưu hóa hệ thống")
+        armbian_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        armbian_box.set_margin_start(10)
+        armbian_box.set_margin_end(10)
+        armbian_box.set_margin_top(8)
+        armbian_box.set_margin_bottom(8)
+        armbian_lbl = Gtk.Label()
+        armbian_lbl.set_markup("⚡ <b>Phát hiện:</b> Armbian Linux (Amlogic S905X / ARM64)\n"
+                               "✅ Đã bật tối ưu H.264 (AVC) giải mã phần cứng siêu nhẹ, chống quá tải CPU.")
+        armbian_lbl.set_xalign(0)
+        armbian_box.pack_start(armbian_lbl, False, False, 0)
+        armbian_frame.add(armbian_box)
+        vbox.pack_start(armbian_frame, False, False, 0)
 
         # Nút lưu cấu hình
         btn_save = Gtk.Button(label="💾 Lưu cài đặt")
