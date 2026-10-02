@@ -15,6 +15,7 @@ import datetime
 import threading
 import subprocess
 import urllib.request
+import urllib.parse
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 
@@ -36,7 +37,7 @@ DEFAULT_SETTINGS = {
     "caching": 3000,
     "player_client": "ios,android,web",
     "hw_accel": True,
-    "max_results": 20,
+    "max_results": 30,
     "dark_mode": True
 }
 
@@ -133,7 +134,7 @@ def fetch_and_load_thumbnail(video_id, width=160, height=90, callback=None):
         except Exception:
             pass
 
-    # Tải thumbnail từ YouTube
+    # Tải thumbnail chất lượng cao từ YouTube (mqdefault: 320x180)
     urls = [
         f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg",
         f"https://i.ytimg.com/vi/{video_id}/default.jpg"
@@ -168,10 +169,14 @@ def request_thumbnail_async(video_id, callback, width=160, height=90):
     thumb_executor.submit(fetch_and_load_thumbnail, video_id, width, height, callback)
 
 # --- Trích xuất luồng & Phát qua VLC ---
-def extract_stream_url(video_id_or_url, quality="720", player_client="ios,android,web"):
-    """Dùng yt-dlp trích xuất đường dẫn direct stream (GoogleVideo URL)"""
+def extract_stream_url(video_id_or_url, quality="720", player_client="android,ios"):
+    """Dùng yt-dlp trích xuất đường dẫn direct stream (hỗ trợ cả progressive lẫn dual audio/video stream)"""
     target = video_id_or_url if video_id_or_url.startswith("http") else f"https://www.youtube.com/watch?v={video_id_or_url}"
-    format_spec = f"best[height<={quality}][acodec!=none]/best[ext=mp4][acodec!=none]/best[acodec!=none]/best"
+    
+    if quality in ["1080", "best"]:
+        format_spec = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}][acodec!=none]/best[acodec!=none]/best"
+    else:
+        format_spec = f"best[height<={quality}][acodec!=none]/bestvideo[height<={quality}]+bestaudio/best[acodec!=none]/best"
     
     env = os.environ.copy()
     env["PATH"] = f"/home/a/.local/bin:{env.get('PATH', '')}"
@@ -183,14 +188,20 @@ def extract_stream_url(video_id_or_url, quality="720", player_client="ios,androi
         "-g",
         target
     ]
+    node_bin = shutil.which("node") or "/home/a/.local/bin/node"
+    if os.path.exists(node_bin):
+        cmd.extend(["--js-runtimes", f"node:{node_bin}"])
+
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=15, env=env)
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=20, env=env)
         lines = [line.strip() for line in proc.stdout.splitlines() if line.strip().startswith("http")]
-        if lines:
-            return lines[0]
+        if len(lines) >= 2:
+            return lines[0], lines[1]
+        elif len(lines) == 1:
+            return lines[0], None
     except Exception:
         pass
-    return None
+    return None, None
 
 def launch_vlc(video, settings, status_callback=None):
     def _run():
@@ -199,15 +210,15 @@ def launch_vlc(video, settings, status_callback=None):
         target_url = f"https://www.youtube.com/watch?v={vid_id}" if vid_id else video.get("url")
 
         if status_callback:
-            GLib.idle_add(status_callback, f"⏳ Đang trích xuất luồng cho: {title[:40]}...")
+            GLib.idle_add(status_callback, f"⏳ Đang trích xuất luồng: {title[:40]}...")
 
-        stream_url = extract_stream_url(
+        video_url, audio_url = extract_stream_url(
             target_url,
             quality=settings.get("quality", "720"),
-            player_client=settings.get("player_client", "ios,android,web")
+            player_client=settings.get("player_client", "android,ios")
         )
 
-        vlc_target = stream_url if stream_url else target_url
+        vlc_target = video_url if video_url else target_url
         caching = settings.get("caching", 3000)
 
         vlc_cmd = [
@@ -217,6 +228,9 @@ def launch_vlc(video, settings, status_callback=None):
             f"--file-caching={caching}",
             f"--network-caching={caching}"
         ]
+        if audio_url:
+            vlc_cmd.append(f"--input-slave={audio_url}")
+
         if not settings.get("hw_accel", True):
             vlc_cmd.extend(["--avcodec-hw=none", "--avcodec-skiploopfilter=3"])
 
@@ -237,40 +251,77 @@ def launch_vlc(video, settings, status_callback=None):
 
     threading.Thread(target=_run, daemon=True).start()
 
-# --- Tìm kiếm & RSS Feed ---
-def search_youtube(query, limit=20):
+# --- Bộ Tìm kiếm Siêu Tốc (Fast Search + Fallback) ---
+def search_youtube_fast(query, limit=30):
     if not query.strip():
         return []
-    env = os.environ.copy()
-    env["PATH"] = f"/home/a/.local/bin:{env.get('PATH', '')}"
-
-    cmd = [
-        "yt-dlp",
-        "--extractor-args", "youtube:player_client=android",
-        "--flat-playlist",
-        "--print", "%(id)s\t%(title)s\t%(uploader)s\t%(duration_string)s",
-        f"ytsearch{limit}:{query}"
-    ]
+    
+    results = []
+    # 1. Thử phân giải trực tiếp từ trang kết quả web YouTube (~2s)
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=25, env=env)
-        results = []
-        for line in proc.stdout.splitlines():
-            parts = line.split("\t")
-            if len(parts) >= 2:
-                vid_id = parts[0].strip()
-                title = parts[1].replace("\n", " ").replace("\r", "").strip()
-                uploader = parts[2].replace("\n", " ").strip() if len(parts) > 2 else "YouTube"
-                duration = parts[3].strip() if len(parts) > 3 else "--:--"
-                results.append({
-                    "id": vid_id,
-                    "title": title,
-                    "uploader": uploader,
-                    "channel": uploader,
-                    "duration": duration
-                })
-        return results
+        url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+            "Accept-Language": "vi,en;q=0.9"
+        })
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+        m = re.search(r"ytInitialData\s*=\s*({.+?});</script>", html) or re.search(r"var ytInitialData\s*=\s*({.+?});", html)
+        if m:
+            data = json.loads(m.group(1))
+            contents = data['contents']['twoColumnSearchResultsRenderer']['primaryContents']['sectionListRenderer']['contents']
+            for section in contents:
+                for item in section.get('itemSectionRenderer', {}).get('contents', []):
+                    v = item.get('videoRenderer')
+                    if v and 'videoId' in v:
+                        title = ''.join(r['text'] for r in v.get('title', {}).get('runs', []))
+                        uploader = ''.join(r['text'] for r in v.get('ownerText', {}).get('runs', []))
+                        dur = v.get('lengthText', {}).get('simpleText', '--:--')
+                        results.append({
+                            'id': v['videoId'],
+                            'title': title,
+                            'uploader': uploader,
+                            'channel': uploader,
+                            'duration': dur
+                        })
     except Exception:
-        return []
+        pass
+
+    # 2. Nếu tìm kiếm trực tiếp trả về ít hơn mong đợi hoặc lỗi, dùng yt-dlp bổ sung
+    if len(results) < limit:
+        env = os.environ.copy()
+        env["PATH"] = f"/home/a/.local/bin:{env.get('PATH', '')}"
+        existing_ids = {r['id'] for r in results}
+        cmd = [
+            "yt-dlp",
+            "--extractor-args", "youtube:player_client=android",
+            "--flat-playlist",
+            "--print", "%(id)s\t%(title)s\t%(uploader)s\t%(duration_string)s",
+            f"ytsearch{limit}:{query}"
+        ]
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=25, env=env)
+            for line in proc.stdout.splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 2:
+                    vid_id = parts[0].strip()
+                    if vid_id in existing_ids:
+                        continue
+                    title = parts[1].replace("\n", " ").replace("\r", "").strip()
+                    uploader = parts[2].replace("\n", " ").strip() if len(parts) > 2 else "YouTube"
+                    duration = parts[3].strip() if len(parts) > 3 else "--:--"
+                    results.append({
+                        "id": vid_id,
+                        "title": title,
+                        "uploader": uploader,
+                        "channel": uploader,
+                        "duration": duration
+                    })
+                    existing_ids.add(vid_id)
+        except Exception:
+            pass
+
+    return results[:limit]
 
 def resolve_channel(target):
     target = target.strip()
@@ -391,7 +442,7 @@ class VideoRow(Gtk.ListBoxRow):
         info_box.pack_start(dur_lbl, False, False, 0)
 
         if "watched_at" in video:
-            hist_lbl = Gtk.Label(label=f"🕒 Xem lúc: {video['watched_at']}")
+            hist_lbl = Gtk.Label(label=f"🕒 Xem: {video['watched_at']}")
             hist_lbl.set_xalign(0)
             info_box.pack_start(hist_lbl, False, False, 0)
 
@@ -415,13 +466,14 @@ class VideoRow(Gtk.ListBoxRow):
 class MainWindow(Gtk.Window):
     def __init__(self):
         super().__init__(title="YouTube VLC Player")
-        self.set_default_size(1050, 700)
+        self.set_default_size(1080, 720)
         self.set_position(Gtk.WindowPosition.CENTER)
 
         self.settings = load_settings()
         if self.settings.get("dark_mode", True):
             Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", True)
 
+        self._setup_icon()
         self._setup_css()
 
         # Layout chính
@@ -432,12 +484,23 @@ class MainWindow(Gtk.Window):
         header = Gtk.HeaderBar()
         header.set_show_close_button(True)
         header.props.title = "YouTube VLC Player"
-        header.props.subtitle = "Giao diện nhẹ - Xem trực tiếp qua VLC"
+        header.props.subtitle = "Phát video nhẹ qua VLC Media Player"
+        
+        # Thêm biểu tượng Icon vào góc HeaderBar
+        if self.app_icon_pixbuf:
+            icon_img = Gtk.Image.new_from_pixbuf(self.app_icon_pixbuf)
+            icon_img.set_margin_start(6)
+            header.pack_start(icon_img)
+
         self.set_titlebar(header)
 
         # Notebook chứa các Tab
         self.notebook = Gtk.Notebook()
         main_vbox.pack_start(self.notebook, True, True, 0)
+
+        # Biến trạng thái tìm kiếm
+        self.current_search_query = ""
+        self.current_search_results = []
 
         # Khởi tạo các Tab
         self._init_search_tab()
@@ -455,6 +518,24 @@ class MainWindow(Gtk.Window):
         # Tải danh sách Subscriptions feed ban đầu ở chế độ nền
         GLib.timeout_add(500, self.refresh_feed)
 
+    def _setup_icon(self):
+        self.app_icon_pixbuf = None
+        icon_candidates = [
+            os.path.expanduser("~/.local/share/icons/hicolor/scalable/apps/yt-vlc.svg"),
+            os.path.expanduser("~/.local/share/icons/hicolor/256x256/apps/yt-vlc.png"),
+            os.path.expanduser("~/.local/share/pixmaps/yt-vlc.png"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "yt-vlc.svg"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "yt-vlc.png")
+        ]
+        for ic in icon_candidates:
+            if os.path.exists(ic):
+                try:
+                    self.set_icon_from_file(ic)
+                    self.app_icon_pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(ic, 24, 24, True)
+                    break
+                except Exception:
+                    pass
+
     def _setup_css(self):
         css_provider = Gtk.CssProvider()
         css = b"""
@@ -469,6 +550,12 @@ class MainWindow(Gtk.Window):
         }
         .suggested-action {
             padding: 6px 16px;
+            font-weight: bold;
+        }
+        .load-more-btn {
+            padding: 10px 20px;
+            font-size: 14px;
+            margin: 12px;
             font-weight: bold;
         }
         """
@@ -521,6 +608,18 @@ class MainWindow(Gtk.Window):
         scroll.add(self.search_list)
         vbox.pack_start(scroll, True, True, 0)
 
+        # Nút "Tải thêm video khác"
+        self.load_more_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.load_more_box.set_halign(Gtk.Align.CENTER)
+        self.btn_load_more = Gtk.Button(label="⬇️ Tải thêm video khác")
+        self.btn_load_more.get_style_context().add_class("load-more-btn")
+        self.btn_load_more.connect("clicked", lambda b: self.load_more_search())
+        self.load_more_box.pack_start(self.btn_load_more, False, False, 0)
+        self.load_more_spinner = Gtk.Spinner()
+        self.load_more_box.pack_start(self.load_more_spinner, False, False, 0)
+        self.load_more_box.set_no_show_all(True)
+        vbox.pack_end(self.load_more_box, False, False, 4)
+
         self.notebook.append_page(vbox, Gtk.Label(label="🔍 Tìm kiếm"))
 
     def do_search(self):
@@ -534,6 +633,10 @@ class MainWindow(Gtk.Window):
             self.play_video_action({"id": vid, "title": query, "channel": "Direct Link"})
             return
 
+        self.current_search_query = query
+        self.current_search_results = []
+        self.load_more_box.hide()
+
         self.search_spinner.start()
         self.set_status(f"Đang tìm kiếm: '{query}'...")
         
@@ -541,8 +644,10 @@ class MainWindow(Gtk.Window):
         for child in self.search_list.get_children():
             self.search_list.remove(child)
 
+        limit = self.settings.get("max_results", 30)
+
         def _search_thread():
-            results = search_youtube(query, limit=self.settings.get("max_results", 20))
+            results = search_youtube_fast(query, limit=limit)
             GLib.idle_add(self._render_search_results, results)
 
         threading.Thread(target=_search_thread, daemon=True).start()
@@ -555,14 +660,55 @@ class MainWindow(Gtk.Window):
             lbl.set_margin_top(30)
             self.search_list.add(lbl)
             self.search_list.show_all()
+            self.load_more_box.hide()
             return
 
+        self.current_search_results = list(results)
         for r in results:
             row = VideoRow(r, self.play_video_action)
             self.search_list.add(row)
 
         self.search_list.show_all()
-        self.set_status(f"Đã tìm thấy {len(results)} video.")
+        self.load_more_box.show_all()
+        self.set_status(f"Đã hiển thị {len(self.current_search_results)} video.")
+
+    def load_more_search(self):
+        if not self.current_search_query:
+            return
+
+        self.load_more_spinner.start()
+        self.btn_load_more.set_sensitive(False)
+        self.set_status(f"Đang tải thêm kết quả cho '{self.current_search_query}'...")
+
+        current_count = len(self.current_search_results)
+        fetch_limit = current_count + self.settings.get("max_results", 30)
+
+        def _more_thread():
+            # Dùng yt-dlp để kéo phạm vi rộng hơn
+            results = search_youtube_fast(self.current_search_query, limit=fetch_limit)
+            GLib.idle_add(self._append_more_results, results)
+
+        threading.Thread(target=_more_thread, daemon=True).start()
+
+    def _append_more_results(self, new_results):
+        self.load_more_spinner.stop()
+        self.btn_load_more.set_sensitive(True)
+
+        existing_ids = {r['id'] for r in self.current_search_results}
+        added_count = 0
+        for r in new_results:
+            if r['id'] not in existing_ids:
+                self.current_search_results.append(r)
+                existing_ids.add(r['id'])
+                row = VideoRow(r, self.play_video_action)
+                self.search_list.add(row)
+                added_count += 1
+
+        self.search_list.show_all()
+        if added_count > 0:
+            self.set_status(f"Đã tải thêm {added_count} video. Tổng cộng: {len(self.current_search_results)} video.")
+        else:
+            self.set_status(f"Không còn video mới thêm. Tổng cộng: {len(self.current_search_results)} video.")
 
     # 2. TAB KÊNH ĐĂNG KÝ (SUBSCRIPTIONS FEED)
     def _init_feed_tab(self):
@@ -618,7 +764,7 @@ class MainWindow(Gtk.Window):
             self.feed_list.show_all()
             return
 
-        for v in videos[:40]:
+        for v in videos[:50]:
             row = VideoRow(v, self.play_video_action)
             self.feed_list.add(row)
 
@@ -830,19 +976,32 @@ class MainWindow(Gtk.Window):
         grid.attach(lbl_c, 0, 1, 1, 1)
         grid.attach(self.combo_cache, 1, 1, 1, 1)
 
-        # 3. Tăng tốc phần cứng
+        # 3. Số lượng video tìm kiếm
+        lbl_res = Gtk.Label(label="Số video tải mỗi lần tìm kiếm:", xalign=0)
+        self.combo_max_res = Gtk.ComboBoxText()
+        max_res_options = [("20", "20 video"),
+                           ("30", "30 video (Khuyên dùng)"),
+                           ("50", "50 video (Nhiều video)"),
+                           ("80", "80 video (Rất nhiều)")]
+        for k, v in max_res_options:
+            self.combo_max_res.append(k, v)
+        self.combo_max_res.set_active_id(str(self.settings.get("max_results", 30)))
+        grid.attach(lbl_res, 0, 2, 1, 1)
+        grid.attach(self.combo_max_res, 1, 2, 1, 1)
+
+        # 4. Tăng tốc phần cứng
         lbl_hw = Gtk.Label(label="Tăng tốc phần cứng (Hardware Accel):", xalign=0)
         self.switch_hw = Gtk.Switch()
         self.switch_hw.set_active(self.settings.get("hw_accel", True))
-        grid.attach(lbl_hw, 0, 2, 1, 1)
-        grid.attach(self.switch_hw, 1, 2, 1, 1)
+        grid.attach(lbl_hw, 0, 3, 1, 1)
+        grid.attach(self.switch_hw, 1, 3, 1, 1)
 
-        # 4. Giao diện tối
+        # 5. Giao diện tối
         lbl_dark = Gtk.Label(label="Giao diện tối (Dark Mode):", xalign=0)
         self.switch_dark = Gtk.Switch()
         self.switch_dark.set_active(self.settings.get("dark_mode", True))
-        grid.attach(lbl_dark, 0, 3, 1, 1)
-        grid.attach(self.switch_dark, 1, 3, 1, 1)
+        grid.attach(lbl_dark, 0, 4, 1, 1)
+        grid.attach(self.switch_dark, 1, 4, 1, 1)
 
         # Nút lưu cấu hình
         btn_save = Gtk.Button(label="💾 Lưu cài đặt")
@@ -862,7 +1021,7 @@ class MainWindow(Gtk.Window):
         about_lbl.set_markup(
             "<small>Dự án mã nguồn mở phát triển bởi <b>starfish367</b>\n"
             "Mã nguồn: <a href='https://github.com/starfish367/yt-vlc'>https://github.com/starfish367/yt-vlc</a>\n"
-            "Phiên bản: 2.0.0 (GTK3 VLC Edition)</small>"
+            "Phiên bản: 2.1.0 (GTK3 VLC Edition)</small>"
         )
         about_lbl.set_line_wrap(True)
         about_lbl.set_xalign(0)
@@ -873,6 +1032,7 @@ class MainWindow(Gtk.Window):
     def do_save_settings(self):
         self.settings["quality"] = self.combo_quality.get_active_id() or "720"
         self.settings["caching"] = int(self.combo_cache.get_active_id() or 3000)
+        self.settings["max_results"] = int(self.combo_max_res.get_active_id() or 30)
         self.settings["hw_accel"] = self.switch_hw.get_active()
         self.settings["dark_mode"] = self.switch_dark.get_active()
         save_settings(self.settings)
