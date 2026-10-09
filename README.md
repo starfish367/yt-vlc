@@ -11,7 +11,8 @@ Một ứng dụng Desktop giao diện đồ họa hiện đại (GTK3) dành ch
 
 * 🚀 **Xem trực tiếp trên VLC:** Tận dụng tối đa bộ giải mã phần cứng (Hardware Acceleration) của VLC, không ngốn RAM/CPU như trình duyệt Chrome/Firefox.
 * 🖼️ **Thumbnail lớn, sắc nét:** Ảnh thu nhỏ tỷ lệ 16:9 rõ ràng, trực quan, dễ bấm.
-* 🔍 **Tìm kiếm nhanh:** Tìm kiếm video hoặc dán link YouTube bất kỳ để phát ngay lập tức.
+* 🔍 **Tìm kiếm nhanh & Hiển thị kênh:** Tìm kiếm video hoặc kênh YouTube, hiển thị trực tiếp thẻ kênh kèm avatar, số lượt đăng ký và nút theo dõi nhanh.
+* 📋 **Duyệt video trong kênh:** Bấm vào bất kỳ kênh nào để mở cửa sổ danh sách video đầy đủ của kênh (hỗ trợ tìm/lọc video thời gian thực, sắp xếp mới nhất/cũ nhất).
 * 📺 **Kênh đăng ký (Subscriptions Feed):** Theo dõi video mới từ các kênh YouTube yêu thích hoàn toàn cục bộ (local RSS), không cần đăng nhập tài khoản Google.
 * 🕒 **Lịch sử xem (Watch History):** Tự động lưu lại các video đã xem để dễ dàng phát lại bất kỳ lúc nào.
 * ⚙️ **Cài đặt linh hoạt:**
