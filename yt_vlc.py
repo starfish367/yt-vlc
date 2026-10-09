@@ -105,7 +105,13 @@ INCOGNITO_SUBS = []
 # QUẢN LÝ DỮ LIỆU & PHIÊN NGƯỜI DÙNG (PROFILES)
 # ==============================================================================
 
+_dirs_ensured = False
+
+
 def ensure_directories():
+    global _dirs_ensured
+    if _dirs_ensured:
+        return
     os.makedirs(CONFIG_DIR, exist_ok=True)
     os.makedirs(THUMB_DIR, exist_ok=True)
     os.makedirs(AVATAR_DIR, exist_ok=True)
@@ -122,42 +128,63 @@ def ensure_directories():
         }
         with open(PROFILES_FILE, "w", encoding="utf-8") as f:
             json.dump(init_profiles, f, ensure_ascii=False, indent=2)
+    _dirs_ensured = True
+
+
+_settings_cache = None
+_profiles_cache = None
 
 
 def load_settings():
+    global _settings_cache
+    if _settings_cache is not None:
+        return _settings_cache.copy()
     ensure_directories()
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
             merged = DEFAULT_SETTINGS.copy()
             merged.update(data)
-            return merged
+            _settings_cache = merged
+            return merged.copy()
     except Exception:
+        _settings_cache = DEFAULT_SETTINGS.copy()
         return DEFAULT_SETTINGS.copy()
 
 
 def save_settings(settings):
+    global _settings_cache
+    _settings_cache = settings.copy()
     ensure_directories()
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
 
 
 def load_profiles_data():
+    global _profiles_cache
+    if _profiles_cache is not None:
+        return _profiles_cache.copy()
     ensure_directories()
     try:
         with open(PROFILES_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            _profiles_cache = json.load(f)
+            return _profiles_cache.copy()
     except Exception:
-        return {
+        fallback = {
             "active": "Mặc định",
             "profiles": [
                 {"name": "Mặc định", "is_incognito": False},
                 {"name": "Ẩn danh", "is_incognito": True}
             ]
         }
+        _profiles_cache = fallback
+        return fallback.copy()
 
 
 def save_profiles_data(pdata):
+    global _profiles_cache, _progress_cache
+    _profiles_cache = pdata.copy()
+    _progress_cache.clear()
     ensure_directories()
     with open(PROFILES_FILE, "w", encoding="utf-8") as f:
         json.dump(pdata, f, ensure_ascii=False, indent=2)
@@ -322,18 +349,27 @@ def add_to_history(video):
     save_history(history)
 
 
+_progress_cache = {}
+
+
 def load_progress():
     ensure_directories()
     pname, is_incognito = get_active_profile()
     if is_incognito:
         return dict(INCOGNITO_PROGRESS)
     pfile = get_progress_file()
+    if pfile in _progress_cache:
+        return _progress_cache[pfile].copy()
     if not os.path.exists(pfile):
+        _progress_cache[pfile] = {}
         return {}
     try:
         with open(pfile, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            _progress_cache[pfile] = data
+            return data.copy()
     except Exception:
+        _progress_cache[pfile] = {}
         return {}
 
 
@@ -345,6 +381,7 @@ def save_progress(progress_dict):
         INCOGNITO_PROGRESS.update(progress_dict)
         return
     pfile = get_progress_file()
+    _progress_cache[pfile] = progress_dict.copy()
     with open(pfile, "w", encoding="utf-8") as f:
         json.dump(progress_dict, f, ensure_ascii=False, indent=2)
 
@@ -386,6 +423,9 @@ _sponsorblock_cache = {}
 _dearrow_cache = {}
 
 
+dearrow_executor = ThreadPoolExecutor(max_workers=3)
+
+
 def fetch_sponsorblock_segments(video_id):
     if not video_id:
         return []
@@ -396,7 +436,7 @@ def fetch_sponsorblock_segments(video_id):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     segments = []
     try:
-        with urllib.request.urlopen(req, timeout=3.5) as resp:
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
             data = json.loads(resp.read().decode())
         for item in data:
             seg = item.get("segment")
@@ -417,7 +457,7 @@ def fetch_dearrow_info(video_id):
     url = f"https://sponsor.ajay.app/api/branding?videoID={video_id}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
-        with urllib.request.urlopen(req, timeout=3.5) as resp:
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
             data = json.loads(resp.read().decode())
         title = None
         for t in data.get("titles", []):
@@ -437,6 +477,20 @@ def fetch_dearrow_info(video_id):
         return None
 
 
+def request_dearrow_async(video_id, on_title_cb=None, on_thumb_cb=None):
+    """Lấy tiêu đề và ảnh bìa DeArrow bất đồng bộ trong background thread, không block UI."""
+    def _worker():
+        d_info = fetch_dearrow_info(video_id)
+        if not d_info:
+            return
+        if on_title_cb and d_info.get("title"):
+            GLib.idle_add(on_title_cb, d_info["title"])
+        if on_thumb_cb and d_info.get("timestamp") is not None:
+            dearrow_url = f"https://dearrow-thumb.ajay.app/api/v1/getThumbnail?videoID={video_id}&time={d_info['timestamp']}"
+            fetch_and_load_image(dearrow_url, 160, 90, on_thumb_cb, is_avatar=False)
+    dearrow_executor.submit(_worker)
+
+
 # ==============================================================================
 # QUẢN LÝ THUMBNAILS & HÌNH ẢNH
 # ==============================================================================
@@ -444,9 +498,16 @@ def fetch_dearrow_info(video_id):
 thumb_executor = ThreadPoolExecutor(max_workers=5)
 
 
+_placeholder_cache = {}
+
+
 def get_placeholder_pixbuf(width=160, height=90):
+    key = (width, height)
+    if key in _placeholder_cache:
+        return _placeholder_cache[key]
     pixbuf = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, width, height)
     pixbuf.fill(0x1e1e1eff)
+    _placeholder_cache[key] = pixbuf
     return pixbuf
 
 
@@ -475,7 +536,7 @@ def fetch_and_load_image(url_or_id, width=160, height=90, callback=None, is_avat
 
         try:
             req = urllib.request.Request(img_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=6) as resp:
+            with urllib.request.urlopen(req, timeout=5) as resp:
                 data = resp.read()
             if data and len(data) > 200:
                 with open(path, "wb") as f:
@@ -491,17 +552,8 @@ def fetch_and_load_image(url_or_id, width=160, height=90, callback=None, is_avat
             GLib.idle_add(callback, get_placeholder_pixbuf(width, height))
         return
 
-    # Video ID: check DeArrow first if enabled
-    settings = load_settings()
+    # Video ID: Kiểm tra tệp đệm trên đĩa trước
     video_id = url_or_id
-    if settings.get("dearrow", True):
-        d_info = fetch_dearrow_info(video_id)
-        if d_info and d_info.get("timestamp") is not None:
-            dearrow_url = f"https://dearrow-thumb.ajay.app/api/v1/getThumbnail?videoID={video_id}&time={d_info['timestamp']}"
-            fetch_and_load_image(dearrow_url, width, height, callback, is_avatar=False)
-            return
-
-    # Standard YouTube thumbnail
     path = os.path.join(THUMB_DIR, f"{video_id}.jpg")
     if os.path.exists(path) and os.path.getsize(path) > 0:
         try:
@@ -1264,8 +1316,8 @@ def search_youtube_fast(query, limit=30):
     except Exception:
         pass
 
-    # yt-dlp fallback nếu thiếu video
-    if len(videos) < limit:
+    # yt-dlp fallback nếu web search không trả về kết quả
+    if not videos and not channels:
         env = os.environ.copy()
         env["PATH"] = f"/home/a/.local/bin:{env.get('PATH', '')}"
         cmd = [
@@ -1573,7 +1625,7 @@ class ChannelRow(Gtk.ListBoxRow):
 
 class VideoRow(Gtk.ListBoxRow):
     """Widget thẻ Video: Hỗ trợ thanh màu đỏ tiến trình xem, mờ thumbnail khi xem hết, và Native GTK Icons."""
-    def __init__(self, video, on_play_callback, on_channel_click=None, on_download_callback=None):
+    def __init__(self, video, on_play_callback, on_channel_click=None, on_download_callback=None, progress_data=None):
         super().__init__()
         self.video = video
         self.on_play_callback = on_play_callback
@@ -1595,7 +1647,7 @@ class VideoRow(Gtk.ListBoxRow):
         self.overlay.add(self.image)
 
         # Kiểm tra tiến trình đã xem
-        prog_data = load_progress().get(vid_id, {})
+        prog_data = progress_data if progress_data is not None else load_progress().get(vid_id, {})
         is_completed = prog_data.get("completed", False)
         watched_sec = prog_data.get("watched", 0)
         total_sec = prog_data.get("total", 0)
@@ -1638,14 +1690,7 @@ class VideoRow(Gtk.ListBoxRow):
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         vbox.set_valign(Gtk.Align.CENTER)
 
-        # DeArrow Title check
         display_title = video.get('title', 'Video')
-        settings = load_settings()
-        if settings.get("dearrow", True) and vid_id:
-            d_info = fetch_dearrow_info(vid_id)
-            if d_info and d_info.get("title"):
-                display_title = d_info["title"]
-
         title_lbl = Gtk.Label()
         title_lbl.set_markup(f"<b>{GLib.markup_escape_text(display_title)}</b>")
         title_lbl.set_line_wrap(True)
@@ -1653,6 +1698,16 @@ class VideoRow(Gtk.ListBoxRow):
         title_lbl.set_max_width_chars(60)
         title_lbl.set_xalign(0)
         vbox.pack_start(title_lbl, False, False, 0)
+
+        # DeArrow Title & Thumb cập nhật bất đồng bộ nền (không block UI)
+        settings = load_settings()
+        if settings.get("dearrow", True) and vid_id:
+            def _on_dearrow_title(new_title):
+                title_lbl.set_markup(f"<b>{GLib.markup_escape_text(new_title)}</b>")
+            def _on_dearrow_thumb(pb):
+                if self.image and pb:
+                    self.image.set_from_pixbuf(pb)
+            request_dearrow_async(vid_id, on_title_cb=_on_dearrow_title, on_thumb_cb=_on_dearrow_thumb)
 
         # Hàng thông tin chi tiết (không dùng Unicode emoji để tránh lỗi Tofu)
         info_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -2005,8 +2060,10 @@ class ChannelVideosDialog(Gtk.Dialog):
             lbl.set_margin_top(20)
             self.video_list.add(lbl)
         else:
+            prog_map = load_progress()
             for v in sorted_v:
-                row = VideoRow(v, self.play_callback, on_download_callback=self.download_callback)
+                p_data = prog_map.get(v.get("id"), {})
+                row = VideoRow(v, self.play_callback, on_download_callback=self.download_callback, progress_data=p_data)
                 self.video_list.add(row)
 
         self.video_list.show_all()
@@ -2079,13 +2136,29 @@ class MainWindow(Gtk.Window):
         self._init_subs_manager_tab()
         self._init_settings_tab()
 
+        # Kết nối chuyển tab để nạp dữ liệu lười (lazy load), tránh nghẽn CPU lúc mở app
+        self.notebook.connect("switch-page", self._on_tab_switched)
+
         # 3. Thanh trạng thái StatusBar
         self.status_bar = Gtk.Statusbar()
         self.status_context = self.status_bar.get_context_id("status")
         main_vbox.pack_end(self.status_bar, False, False, 0)
         self.set_status("Sẵn sàng")
 
-        GLib.timeout_add(500, self.refresh_feed)
+        def _start_feed():
+            # Chỉ nạp nền nếu người dùng chuyển sang tab hoặc sau khi UI đã ổn định
+            if self.notebook.get_current_page() == 2 and not self.current_feed_videos:
+                self.refresh_feed()
+            return False
+        GLib.timeout_add(1500, _start_feed)
+
+    def _on_tab_switched(self, notebook, page, page_num):
+        if page_num == 1 and not self.current_explore_videos:
+            self.refresh_explore()
+        elif page_num == 2 and not self.current_feed_videos:
+            self.refresh_feed()
+        elif page_num == 3:
+            self.reload_history()
 
     def _setup_icon(self):
         self.app_icon_pixbuf = None
@@ -2214,10 +2287,13 @@ class MainWindow(Gtk.Window):
 
     def _on_playback_completed(self, vid_id):
         self.reload_history()
-        # Redraw visible lists to immediately show updated watch progress
-        self._redraw_search_list()
-        self._redraw_feed_list()
-        self._redraw_explore_list()
+        curr_page = self.notebook.get_current_page()
+        if curr_page == 0:
+            self._redraw_search_list()
+        elif curr_page == 1:
+            self._redraw_explore_list()
+        elif curr_page == 2:
+            self._redraw_feed_list()
 
     def download_video_action(self, video, quality="720", is_audio=False):
         """Kích hoạt tải video hoặc audio."""
@@ -2414,11 +2490,13 @@ class MainWindow(Gtk.Window):
             mode_label = self.search_sort_combo.get_active_text() or "Mới nhất"
             mode = SORT_MODES.get(mode_label, "newest")
             sorted_results = sort_videos(self.current_search_results, mode)
+            prog_map = load_progress()
             for r in sorted_results:
                 row = VideoRow(
                     r, self.play_video_action,
                     on_channel_click=self.open_channel_videos,
-                    on_download_callback=lambda v: self.download_video_action(v, self.settings.get("quality", "720"))
+                    on_download_callback=lambda v: self.download_video_action(v, self.settings.get("quality", "720")),
+                    progress_data=prog_map.get(r.get("id"), {})
                 )
                 self.search_list.add(row)
 
@@ -2509,7 +2587,6 @@ class MainWindow(Gtk.Window):
         adj.connect("value-changed", self._on_explore_scroll_changed)
 
         self.notebook.append_page(vbox, create_tab_label("applications-multimedia-symbolic", "Thịnh hành"))
-        GLib.timeout_add(1000, self.refresh_explore)
 
     def _on_explore_scroll_changed(self, adj):
         if not self.settings.get("auto_load_more", True):
@@ -2548,11 +2625,13 @@ class MainWindow(Gtk.Window):
             lbl.set_margin_top(30)
             self.explore_list.add(lbl)
         else:
+            prog_map = load_progress()
             for v in self.current_explore_videos:
                 row = VideoRow(
                     v, self.play_video_action,
                     on_channel_click=self.open_channel_videos,
-                    on_download_callback=lambda vid: self.download_video_action(vid, self.settings.get("quality", "720"))
+                    on_download_callback=lambda vid: self.download_video_action(vid, self.settings.get("quality", "720")),
+                    progress_data=prog_map.get(v.get("id"), {})
                 )
                 self.explore_list.add(row)
         self.explore_list.show_all()
@@ -2657,11 +2736,13 @@ class MainWindow(Gtk.Window):
         mode_label = self.feed_sort_combo.get_active_text() or "Mới nhất"
         mode = SORT_MODES.get(mode_label, "newest")
         sorted_videos = sort_videos(self.current_feed_videos, mode)
+        prog_map = load_progress()
         for v in sorted_videos[:60]:
             row = VideoRow(
                 v, self.play_video_action,
                 on_channel_click=self.open_channel_videos,
-                on_download_callback=lambda vid: self.download_video_action(vid, self.settings.get("quality", "720"))
+                on_download_callback=lambda vid: self.download_video_action(vid, self.settings.get("quality", "720")),
+                progress_data=prog_map.get(v.get("id"), {})
             )
             self.feed_list.add(row)
         self.feed_list.show_all()
@@ -2709,11 +2790,13 @@ class MainWindow(Gtk.Window):
             self.history_list.add(lbl)
             self.history_list.show_all()
             return
+        prog_map = load_progress()
         for h in history:
             row = VideoRow(
                 h, self.play_video_action,
                 on_channel_click=self.open_channel_videos,
-                on_download_callback=lambda vid: self.download_video_action(vid, self.settings.get("quality", "720"))
+                on_download_callback=lambda vid: self.download_video_action(vid, self.settings.get("quality", "720")),
+                progress_data=prog_map.get(h.get("id"), {})
             )
             self.history_list.add(row)
         self.history_list.show_all()
