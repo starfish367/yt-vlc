@@ -1,1 +1,5 @@
 __pycache__/
+.agents
+.agents/
+ORIGINAL_REQUEST.md
+*.log

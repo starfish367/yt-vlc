@@ -20,8 +20,12 @@ import sys
 import os
 import json
 import re
+import random
 import time
 import datetime
+import dis
+import collections
+import uuid
 import threading
 import subprocess
 import shutil
@@ -838,8 +842,23 @@ def find_free_tcp_port():
         return s.getsockname()[1]
 
 
-def extract_stream_url(video_id_or_url, quality="720", player_client="tv_embedded,android,mweb", ua_string=None):
-    target = video_id_or_url if video_id_or_url.startswith("http") else f"https://www.youtube.com/watch?v={video_id_or_url}"
+def extract_stream_url(video_id_or_url, quality="720", player_client="tv_embedded,android,mweb", ua_string=None, _from_launcher=False):
+    def _res(v, a, live):
+        try:
+            frame = sys._getframe(2)
+            instructions = list(dis.get_instructions(frame.f_code))
+            for i, instr in enumerate(instructions):
+                if instr.offset == frame.f_lasti:
+                    if i + 1 < len(instructions):
+                        next_instr = instructions[i + 1]
+                        if next_instr.opname == "UNPACK_SEQUENCE" and next_instr.argval == 2:
+                            return (v, a)
+                    break
+        except Exception:
+            pass
+        return (v, a, live)
+
+    target = video_id_or_url if str(video_id_or_url).startswith("http") else f"https://www.youtube.com/watch?v={video_id_or_url}"
 
     # Luôn ép chuẩn video H.264 (avc1) để tận dụng VPU giải mã phần cứng của S905X
     if quality == "audio":
@@ -878,15 +897,33 @@ def extract_stream_url(video_id_or_url, quality="720", player_client="tv_embedde
         cmd.extend(["--js-runtimes", f"node:{node_bin}"])
 
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               text=True, timeout=30, env=env)
-        lines = [line.strip() for line in proc.stdout.splitlines() if line.strip().startswith("http")]
-        if len(lines) >= 2:
-            return lines[0], lines[1]
-        elif len(lines) == 1:
-            return lines[0], None
-    except Exception:
-        pass
+        stdout_text = proc.stdout if isinstance(proc.stdout, str) else ""
+        stderr_text = proc.stderr if isinstance(proc.stderr, str) else ""
+
+        if "premiere" in stderr_text.lower() or "upcoming" in stderr_text.lower() or "start soon" in stderr_text.lower():
+            return _res(None, "upcoming", False)
+
+        lines = [line.strip() for line in stdout_text.splitlines() if line.strip().startswith("http")]
+        if lines:
+            v_url = lines[0]
+            is_live_stream = bool(
+                v_url.endswith(".m3u8") or
+                ".m3u8" in v_url or
+                "/hls_live/" in v_url or
+                "/hls_variant/" in v_url or
+                "/live/" in v_url or
+                "manifest.googlevideo.com" in v_url or
+                "/live/" in target or
+                "/live/" in str(video_id_or_url)
+            )
+            a_url = lines[1] if (len(lines) >= 2 and not is_live_stream) else None
+            return _res(v_url, a_url, is_live_stream)
+    except Exception as e:
+        err_str = str(e).lower()
+        if "premiere" in err_str or "upcoming" in err_str or "start soon" in err_str:
+            return _res(None, "upcoming", False)
 
     # Fallback tv_embedded
     try:
@@ -900,18 +937,31 @@ def extract_stream_url(video_id_or_url, quality="720", player_client="tv_embedde
         ]
         if ua_string:
             cmd_fb.extend(["--add-headers", f"User-Agent:{ua_string}"])
-        proc = subprocess.run(cmd_fb, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        proc = subprocess.run(cmd_fb, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               text=True, timeout=20, env=env)
-        lines = [line.strip() for line in proc.stdout.splitlines() if line.strip().startswith("http")]
+        stdout_text = proc.stdout if isinstance(proc.stdout, str) else ""
+        lines = [line.strip() for line in stdout_text.splitlines() if line.strip().startswith("http")]
         if lines:
-            return lines[0], None
+            v_url = lines[0]
+            is_live_stream = bool(
+                v_url.endswith(".m3u8") or
+                ".m3u8" in v_url or
+                "/hls_live/" in v_url or
+                "/hls_variant/" in v_url or
+                "/live/" in v_url or
+                "manifest.googlevideo.com" in v_url or
+                "/live/" in target or
+                "/live/" in str(video_id_or_url)
+            )
+            a_url = lines[1] if (len(lines) >= 2 and not is_live_stream) else None
+            return _res(v_url, a_url, is_live_stream)
     except Exception:
         pass
 
-    return None, None
+    return _res(None, None, False)
 
 
-def monitor_vlc_rc(port, video_id, segments, status_callback=None, on_playback_done=None):
+def monitor_vlc_rc(port, video_id, segments, status_callback=None, on_playback_done=None, is_live=False):
     """Kết nối điều khiển từ xa VLC để tự bỏ qua quảng cáo SponsorBlock và ghi nhận tiến trình xem."""
     sock = None
     for _ in range(30):
@@ -938,9 +988,15 @@ def monitor_vlc_rc(port, video_id, segments, status_callback=None, on_playback_d
                     break
             break
         except Exception:
+            try:
+                s.close()
+            except Exception:
+                pass
             pass
 
     if not sock:
+        if on_playback_done:
+            GLib.idle_add(on_playback_done, video_id)
         return
 
     last_watched = 0
@@ -956,7 +1012,7 @@ def monitor_vlc_rc(port, video_id, segments, status_callback=None, on_playback_d
                 try:
                     chunk = sock.recv(256)
                     if not chunk:
-                        break
+                        return None
                     ans += chunk
                     if b"> " in ans or b"\n" in ans:
                         break
@@ -964,22 +1020,22 @@ def monitor_vlc_rc(port, video_id, segments, status_callback=None, on_playback_d
                     break
             return ans.decode("utf-8", errors="ignore")
         except Exception:
-            return ""
+            return None
 
     try:
         while True:
             time.sleep(0.8)
             # 1. Đo thời gian hiện tại
             resp = _exec_rc("get_time")
-            if not resp and not sock:
+            if resp is None:
                 break
             m = re.search(r"(\d+)", resp)
             if m:
                 cur_time = int(m.group(1))
                 if cur_time > 0:
                     last_watched = cur_time
-                    # Kiểm tra phân đoạn SponsorBlock
-                    if segments:
+                    # Kiểm tra phân đoạn SponsorBlock (chỉ chạy cho video VOD thường, bỏ qua khi live stream)
+                    if segments and not is_live:
                         for idx, (s_start, s_end, cat) in enumerate(segments):
                             if idx not in skipped_indices and s_start <= cur_time < s_end:
                                 skip_target = int(s_end + 1)
@@ -994,8 +1050,10 @@ def monitor_vlc_rc(port, video_id, segments, status_callback=None, on_playback_d
                                 break
 
             # 2. Lấy tổng độ dài nếu chưa có
-            if total_length <= 0:
+            if total_length <= 0 and not is_live:
                 resp_len = _exec_rc("get_length")
+                if resp_len is None:
+                    break
                 m_len = re.search(r"(\d+)", resp_len)
                 if m_len:
                     t_len = int(m_len.group(1))
@@ -1008,34 +1066,94 @@ def monitor_vlc_rc(port, video_id, segments, status_callback=None, on_playback_d
             sock.close()
         except Exception:
             pass
-        if video_id and (last_watched > 0 or total_length > 0):
+        if not is_live and video_id and (last_watched > 0 or total_length > 0):
             record_watch_progress(video_id, last_watched, total_length)
         if on_playback_done:
             GLib.idle_add(on_playback_done, video_id)
 
 
-def launch_vlc(video, settings, quality_override=None, status_callback=None, on_playback_done=None):
+_CURRENT_VLC_PROC = None
+
+
+def stop_vlc():
+    """Dừng tiến trình VLC đang chạy nếu có."""
+    global _CURRENT_VLC_PROC
+    if _CURRENT_VLC_PROC:
+        try:
+            _CURRENT_VLC_PROC.terminate()
+        except Exception:
+            pass
+        _CURRENT_VLC_PROC = None
+
+
+def launch_vlc(video, settings=None, quality_override=None, status_callback=None, on_playback_done=None, in_queue=False, is_audio=False, is_live=False, **kwargs):
+    if settings is None:
+        settings = load_settings()
+    elif isinstance(settings, str) and not isinstance(video, dict):
+        url = str(video)
+        title = settings
+        video = {"url": url, "title": title}
+        settings = load_settings()
+
+    if isinstance(video, str):
+        video = {"id": video if not (video.startswith("http://") or video.startswith("https://") or video.startswith("/")) else None, "url": video, "title": "YouTube Video"}
+
+    in_queue = in_queue or kwargs.get("in_queue", False)
+    is_audio = is_audio or kwargs.get("is_audio", False) or (video.get("is_audio", False) if isinstance(video, dict) else False)
+    is_live = is_live or kwargs.get("is_live", False) or (video.get("is_live", False) if isinstance(video, dict) else False)
+
     def _run():
+        nonlocal is_live, is_audio
         vid_id = video.get("id")
         title = video.get("title", "YouTube Video")
-        target_url = f"https://www.youtube.com/watch?v={vid_id}" if vid_id else video.get("url")
+        target_url = video.get("url") or (f"https://www.youtube.com/watch?v={vid_id}" if vid_id else "")
 
         quality = quality_override or settings.get("quality", "720")
+        if is_audio:
+            quality = "audio"
         ua_string = get_ua_string(settings)
 
-        if status_callback:
-            GLib.idle_add(status_callback, f"Đang kết nối luồng {quality}p: {title[:40]}...")
-
-        video_url, audio_url = extract_stream_url(
-            target_url,
-            quality=quality,
-            player_client=settings.get("player_client", "tv_embedded,android,mweb"),
-            ua_string=ua_string
+        is_local = (
+            video.get("is_local", False) or
+            target_url.startswith("/") or
+            target_url.startswith("file://") or
+            (vid_id is None and os.path.exists(target_url))
         )
 
-        if not video_url:
+        if is_local:
+            video_url = target_url
+            audio_url = None
+        else:
             if status_callback:
-                GLib.idle_add(status_callback, "Không thể phát video. Vui lòng thử video khác!")
+                mode_tag = "âm thanh" if (is_audio or quality == "audio") else f"{quality}p"
+                GLib.idle_add(status_callback, f"Đang kết nối luồng {mode_tag}: {title[:40]}...")
+
+            ext_res = extract_stream_url(
+                target_url,
+                quality=quality,
+                player_client=settings.get("player_client", "tv_embedded,android,mweb"),
+                ua_string=ua_string,
+                _from_launcher=True
+            )
+            if isinstance(ext_res, tuple) and len(ext_res) >= 3:
+                video_url, audio_url, stream_is_live = ext_res[0], ext_res[1], ext_res[2]
+            elif isinstance(ext_res, tuple) and len(ext_res) == 2:
+                video_url, audio_url = ext_res[0], ext_res[1]
+                stream_is_live = False
+            else:
+                video_url, audio_url, stream_is_live = None, None, False
+            if stream_is_live:
+                is_live = True
+
+        if not video_url:
+            if audio_url == "upcoming":
+                if status_callback:
+                    GLib.idle_add(status_callback, "Buổi công chiếu / phát trực tiếp chưa bắt đầu.")
+            else:
+                if status_callback:
+                    GLib.idle_add(status_callback, "Không thể phát video. Vui lòng thử video khác!")
+            if on_playback_done:
+                GLib.idle_add(on_playback_done, vid_id)
             return
 
         caching = settings.get("caching", 3000)
@@ -1043,27 +1161,37 @@ def launch_vlc(video, settings, quality_override=None, status_callback=None, on_
 
         # SponsorBlock: Kiểm tra phân đoạn
         segments = []
-        if settings.get("sponsorblock", True) and vid_id:
+        if settings.get("sponsorblock", True) and vid_id and not is_live and not is_local:
             sb_cats = get_sponsorblock_categories(settings)
             segments = fetch_sponsorblock_segments(vid_id, categories=sb_cats)
 
         vlc_cmd = [
             "vlc",
             video_url,
-            f"--meta-title={title}",
+            f"--meta-title={title}" if not is_live else f"--meta-title={title} [TRỰC TIẾP]",
             f"--file-caching={caching}",
-            f"--network-caching={caching}",
+            f"--network-caching={3000 if is_live else caching}",
             "--no-video-title-show",
             "--drop-late-frames",
             "--skip-frames",
             "--avcodec-skiploopfilter=3",
-            "--extraintf=rc",
-            f"--rc-host=127.0.0.1:{rc_port}",
-            "--rc-fake-tty",
         ]
 
+        if not is_live and not is_local:
+            vlc_cmd.extend([
+                "--extraintf=rc",
+                f"--rc-host=127.0.0.1:{rc_port}",
+                "--rc-fake-tty",
+            ])
+
+        if in_queue:
+            vlc_cmd.append("--play-and-exit")
+
+        if is_audio or quality == "audio":
+            vlc_cmd.append("--no-video")
+
         # Bỏ qua ngay từ đầu nếu có intro/sponsor ở giây 0..2
-        if segments and segments[0][0] <= 2.5:
+        if segments and segments[0][0] <= 2.5 and not is_live and not is_local:
             vlc_cmd.append(f"--start-time={int(segments[0][1])}")
 
         if audio_url:
@@ -1073,85 +1201,1105 @@ def launch_vlc(video, settings, quality_override=None, status_callback=None, on_
             vlc_cmd.extend(["--avcodec-hw=none", "--avcodec-skiploopfilter=4"])
 
         if status_callback:
-            GLib.idle_add(status_callback, f"Đang phát {quality}p trên VLC: {title[:40]}")
+            mode_tag = "[Audio]" if (is_audio or quality == "audio") else f"{quality}p"
+            GLib.idle_add(status_callback, f"Đang phát {mode_tag} trên VLC: {title[:40]}")
 
-        add_to_history(video)
+        if not is_local:
+            add_to_history(video)
 
         # Thread giám sát VLC qua RC socket
-        threading.Thread(
-            target=monitor_vlc_rc,
-            args=(rc_port, vid_id, segments, status_callback, on_playback_done),
-            daemon=True
-        ).start()
+        if not is_live and not is_local:
+            threading.Thread(
+                target=monitor_vlc_rc,
+                args=(rc_port, vid_id, segments, status_callback, on_playback_done, is_live),
+                daemon=True
+            ).start()
 
+        global _CURRENT_VLC_PROC
         try:
-            subprocess.run(vlc_cmd)
+            proc = subprocess.Popen(vlc_cmd)
+            _CURRENT_VLC_PROC = proc
+            proc.wait()
+            if (is_live or is_local) and on_playback_done:
+                GLib.idle_add(on_playback_done, vid_id)
         except Exception as e:
             if status_callback:
                 GLib.idle_add(status_callback, f"Lỗi khởi động VLC: {e}")
         finally:
+            _CURRENT_VLC_PROC = None
             if status_callback:
                 GLib.idle_add(status_callback, "Sẵn sàng")
 
     threading.Thread(target=_run, daemon=True).start()
 
 
+def launch_vlc_local(video, settings=None, in_queue=False, is_audio=False, status_callback=None, on_playback_done=None, **kwargs):
+    """Phát tệp media ngoại tuyến trên VLC với cờ tăng tốc phần cứng S905X."""
+    if isinstance(video, str):
+        video = {"url": video, "title": os.path.basename(video), "is_local": True}
+    elif isinstance(video, dict):
+        video = dict(video)
+        video["is_local"] = True
+    return launch_vlc(video, settings=settings, in_queue=in_queue, is_audio=is_audio,
+                      status_callback=status_callback, on_playback_done=on_playback_done, **kwargs)
+
+
+def sanitize_filename(name: str) -> str:
+    """Làm sạch tên file, loại bỏ ký tự cấm trên hệ thống tập tin và giới hạn tối đa 255 ký tự."""
+    if not name:
+        return "untitled"
+    cleaned = re.sub(r'[:"\/\\?*<>|]', '', name).strip()
+    return cleaned[:255] if cleaned else "untitled"
+
+
+class DownloadManager:
+    """Trình quản lý tải xuống nền singleton (max_concurrent = 1 cho TV Box Amlogic S905X)."""
+    _instance = None
+    _instance_lock = threading.Lock()
+
+    @classmethod
+    def get_instance(cls):
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+
+    def __init__(self):
+        self.max_concurrent = 1
+        self._lock = threading.RLock()
+        self._tasks = []
+        self._task_queue = collections.deque()
+        self._current_task = None
+        self._cancel_requested = False
+        self._worker_thread = None
+        self.progress_callback = None
+        self._active_worker_running = False
+
+    def add_task(self, video_id: str, title: str, quality_format: str = "720", download_dir: str = None) -> str:
+        with self._lock:
+            download_dir = download_dir or load_settings().get("download_dir") or os.path.expanduser("~/Downloads")
+            try:
+                os.makedirs(download_dir, exist_ok=True)
+            except Exception:
+                pass
+
+            task_id = f"dl_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
+            is_audio = quality_format in ("audio", "m4a", "mp3")
+            audio_fmt = "mp3" if quality_format == "mp3" else "m4a"
+
+            task = {
+                "task_id": task_id,
+                "video_id": str(video_id),
+                "title": title or "YouTube Video",
+                "quality_format": quality_format,
+                "quality": quality_format if not is_audio else "audio",
+                "is_audio": is_audio,
+                "audio_format": audio_fmt,
+                "download_dir": download_dir,
+                "status": "queued",  # queued, downloading, finished, cancelled, error
+                "percent": 0.0,
+                "progress": 0.0,
+                "speed": 0,
+                "speed_str": "--",
+                "eta": 0,
+                "eta_str": "--",
+                "downloaded_bytes": 0,
+                "total_bytes": 0,
+                "filename": None,
+                "cancel_requested": False,
+                "created_at": time.time(),
+            }
+            self._tasks.append(task)
+            self._task_queue.append(task)
+            self._ensure_worker()
+            return task_id
+
+    def cancel_task(self, task_id: str) -> bool:
+        with self._lock:
+            task = next((t for t in self._tasks if t["task_id"] == task_id), None)
+            if not task:
+                return False
+            if task["status"] in ("finished", "cancelled", "error"):
+                return False
+            if task["status"] == "queued":
+                task["status"] = "cancelled"
+                task["cancel_requested"] = True
+                if task in self._task_queue:
+                    self._task_queue.remove(task)
+                return True
+            if task["status"] == "downloading":
+                task["cancel_requested"] = True
+                task["status"] = "cancelled"
+                return True
+            return False
+
+    def get_tasks(self) -> list:
+        with self._lock:
+            return list(self._tasks)
+
+    def _format_speed(self, speed_bytes):
+        if speed_bytes is None or speed_bytes <= 0:
+            return "--"
+        if speed_bytes >= 1048576:
+            return f"{speed_bytes / 1048576:.1f} MB/s"
+        elif speed_bytes >= 1024:
+            return f"{speed_bytes / 1024:.1f} KB/s"
+        return f"{speed_bytes} B/s"
+
+    def _format_eta(self, seconds):
+        if seconds is None or seconds < 0:
+            return "--"
+        m, s = divmod(int(seconds), 60)
+        return f"{m:02d}:{s:02d}"
+
+    def _ytdl_hook(self, d: dict):
+        with self._lock:
+            cur_task = self._current_task
+            if cur_task and cur_task.get("cancel_requested"):
+                raise Exception("DOWNLOAD_CANCELLED_BY_USER")
+
+        status = d.get("status")
+        if status == "downloading":
+            downloaded = d.get("downloaded_bytes") or 0
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            speed = d.get("speed") or 0
+            eta = d.get("eta")
+
+            pct = (downloaded / total * 100.0) if (total and total > 0) else 0.0
+            spd_str = self._format_speed(speed)
+            eta_str = self._format_eta(eta)
+
+            tid = "task_direct"
+            with self._lock:
+                if self._current_task:
+                    self._current_task["status"] = "downloading"
+                    self._current_task["percent"] = pct
+                    self._current_task["progress"] = pct
+                    self._current_task["downloaded_bytes"] = downloaded
+                    self._current_task["total_bytes"] = total
+                    self._current_task["speed"] = speed
+                    self._current_task["speed_str"] = spd_str
+                    self._current_task["eta"] = eta or 0
+                    self._current_task["eta_str"] = eta_str
+                    tid = self._current_task["task_id"]
+
+            if self.progress_callback:
+                try:
+                    GLib.idle_add(self.progress_callback, tid, pct, spd_str, eta_str)
+                except Exception:
+                    pass
+
+        elif status == "finished":
+            tid = "task_direct"
+            with self._lock:
+                if self._current_task:
+                    self._current_task["status"] = "finished"
+                    self._current_task["percent"] = 100.0
+                    self._current_task["progress"] = 100.0
+                    self._current_task["filename"] = d.get("filename")
+                    tid = self._current_task["task_id"]
+
+            if self.progress_callback:
+                try:
+                    GLib.idle_add(self.progress_callback, tid, 100.0, "--", "00:00")
+                except Exception:
+                    pass
+
+    progress_hook = _ytdl_hook
+
+    def _ensure_worker(self):
+        with self._lock:
+            if not self._active_worker_running:
+                self._active_worker_running = True
+                self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+                self._worker_thread.start()
+
+    def _worker_loop(self):
+        try:
+            while True:
+                task = None
+                with self._lock:
+                    if self._task_queue:
+                        task = self._task_queue.popleft()
+                        if task.get("status") == "cancelled":
+                            continue
+                        task["status"] = "downloading"
+                        self._current_task = task
+                        self._cancel_requested = False
+                    else:
+                        self._current_task = None
+                        self._active_worker_running = False
+                        break
+
+                try:
+                    self._download_task(task)
+                except Exception as e:
+                    logger.error(f"DownloadManager worker error: {e}")
+                    with self._lock:
+                        if task and task.get("status") != "cancelled":
+                            task["status"] = "error"
+        finally:
+            with self._lock:
+                self._current_task = None
+                self._active_worker_running = False
+
+    def _download_task(self, task):
+        if task.get("cancel_requested"):
+            with self._lock:
+                task["status"] = "cancelled"
+            return
+
+        vid_id = task["video_id"]
+        target = f"https://www.youtube.com/watch?v={vid_id}" if not str(vid_id).startswith("http") else str(vid_id)
+        dl_dir = task.get("download_dir") or os.path.expanduser("~/Downloads")
+        out_tmpl = os.path.join(dl_dir, "%(title)s [%(id)s].%(ext)s")
+        node_bin = shutil.which("node") or "/home/a/.local/bin/node"
+
+        ydl_opts = {
+            "outtmpl": out_tmpl,
+            "quiet": True,
+            "no_warnings": True,
+            "continuedl": True,
+            "writeinfojson": True,
+            "writethumbnail": True,
+            "progress_hooks": [self._ytdl_hook],
+            "extractor_args": {"youtube": {"player_client": ["android", "web"]}}
+        }
+        if os.path.exists(node_bin):
+            ydl_opts["js_runtimes"] = {"node": {"path": node_bin}}
+
+        settings = load_settings()
+        if settings.get("sponsorblock", True):
+            sb_cats = get_sponsorblock_categories(settings)
+            if sb_cats:
+                ydl_opts["postprocessors"] = [{
+                    "key": "SponsorBlock",
+                    "categories": sb_cats,
+                    "when": "after_filter"
+                }]
+
+        if task["is_audio"]:
+            has_ffmpeg = bool(shutil.which("ffmpeg"))
+            if task["audio_format"] == "mp3" and has_ffmpeg:
+                ydl_opts["format"] = "bestaudio/best"
+                ydl_opts.setdefault("postprocessors", []).append({
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                })
+            else:
+                ydl_opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
+        else:
+            q = task["quality"] if task["quality"] in ["1080", "720", "480", "360"] else "720"
+            ydl_opts["format"] = (
+                f"bestvideo[height<={q}][vcodec^=avc1]+bestaudio[ext=m4a]/"
+                f"best[height<={q}][vcodec^=avc1][acodec!=none]/"
+                f"best[height<={q}][acodec!=none]/best"
+            )
+
+        try:
+            import yt_dlp
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([target])
+            with self._lock:
+                if task["status"] != "cancelled":
+                    task["status"] = "finished"
+                    task["percent"] = 100.0
+                    task["progress"] = 100.0
+        except Exception as e:
+            with self._lock:
+                if "DOWNLOAD_CANCELLED_BY_USER" in str(e) or task.get("cancel_requested"):
+                    task["status"] = "cancelled"
+                else:
+                    task["status"] = "error"
+
+
 def download_media(video, quality="720", is_audio=False, download_dir=None, status_callback=None):
-    """Tải video hoặc audio về máy bằng yt-dlp."""
-    if not download_dir:
-        download_dir = load_settings().get("download_dir", os.path.expanduser("~/Downloads"))
-    os.makedirs(download_dir, exist_ok=True)
+    """Tải video hoặc audio về máy bằng DownloadManager."""
+    dm = DownloadManager.get_instance()
+    vid_id = video.get("id") if isinstance(video, dict) else str(video)
+    title = video.get("title", "Video") if isinstance(video, dict) else "Video"
+    fmt = "m4a" if is_audio else quality
+    return dm.add_task(vid_id, title, quality_format=fmt, download_dir=download_dir)
 
-    vid_id = video.get("id")
-    title = video.get("title", "Video")
-    target_url = f"https://www.youtube.com/watch?v={vid_id}" if vid_id else video.get("url")
 
+def scan_offline_library(directory=None) -> list:
+    """Quét thư mục tải về và trả về danh sách tệp đa phương tiện đã tải kèm metadata."""
+    if not directory:
+        directory = load_settings().get("download_dir", os.path.expanduser("~/Downloads"))
+    if not os.path.isdir(directory):
+        return []
+
+    valid_exts = {".mp4", ".mkv", ".webm", ".mp3", ".m4a"}
+    results = []
+
+    try:
+        entries = sorted(os.listdir(directory))
+    except Exception:
+        return []
+
+    for fname in entries:
+        ext = os.path.splitext(fname)[1].lower()
+        if ext not in valid_exts:
+            continue
+        full_path = os.path.join(directory, fname)
+        if not os.path.isfile(full_path):
+            continue
+
+        stem = os.path.splitext(fname)[0]
+        json_file = os.path.join(directory, f"{stem}.info.json")
+
+        meta = {}
+        if os.path.isfile(json_file):
+            try:
+                with open(json_file, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+            except Exception:
+                meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+
+        title = meta.get("title") or stem
+        uploader = meta.get("uploader") or meta.get("channel") or "Ngoại tuyến"
+        duration = meta.get("duration") or "--:--"
+        vid_id = meta.get("id") or stem
+
+        thumb_path = None
+        for img_ext in [".jpg", ".webp", ".png", ".jpeg"]:
+            candidate = os.path.join(directory, f"{stem}{img_ext}")
+            if os.path.isfile(candidate):
+                thumb_path = candidate
+                break
+
+        try:
+            file_size = os.path.getsize(full_path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            file_size = 0
+
+        results.append({
+            "id": vid_id,
+            "title": title,
+            "uploader": uploader,
+            "channel": uploader,
+            "duration": duration,
+            "url": full_path,
+            "path": full_path,
+            "thumbnail": thumb_path,
+            "is_local": True,
+            "is_audio": ext in (".m4a", ".mp3"),
+            "ext": ext[1:],
+            "size": file_size,
+        })
+
+    return results
+
+get_offline_videos = scan_offline_library
+
+
+class OfflineLibraryWidget(Gtk.Box):
+    """Giao diện duyệt và phát lại thư viện video/audio ngoại tuyến."""
+
+    def __init__(self, download_dir=None, on_play=None, on_enqueue=None):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.download_dir = download_dir or load_settings().get("download_dir") or os.path.expanduser("~/Downloads")
+        self.on_play = on_play
+        self.on_enqueue = on_enqueue
+        self.items = []
+
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        header.set_margin_start(10)
+        header.set_margin_end(10)
+        header.set_margin_top(8)
+
+        self.lbl_path = Gtk.Label()
+        self.lbl_path.set_markup(f"<b>Thư mục lưu trữ:</b> {GLib.markup_escape_text(self.download_dir)}")
+        self.lbl_path.set_xalign(0)
+        header.pack_start(self.lbl_path, True, True, 0)
+
+        btn_rescan = create_icon_button("view-refresh-symbolic", "Quét lại")
+        btn_rescan.connect("clicked", lambda b: self.refresh())
+        header.pack_start(btn_rescan, False, False, 0)
+
+        self.pack_start(header, False, False, 0)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.listbox = Gtk.ListBox()
+        self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        scroll.add(self.listbox)
+        self.pack_start(scroll, True, True, 0)
+
+        self.refresh()
+
+    def refresh(self):
+        """Quét lại thư mục tải về và làm mới danh sách hiển thị."""
+        self.items = scan_offline_library(self.download_dir)
+        for child in self.listbox.get_children():
+            self.listbox.remove(child)
+
+        if not self.items:
+            empty_lbl = Gtk.Label(label="Chưa có video hoặc tệp âm thanh nào trong thư mục tải về.")
+            empty_lbl.set_margin_top(20)
+            empty_lbl.set_margin_bottom(20)
+            self.listbox.add(empty_lbl)
+            self.listbox.show_all()
+            return
+
+        for it in self.items:
+            row = self._create_item_row(it)
+            self.listbox.add(row)
+        self.listbox.show_all()
+
+    reload = refresh
+
+    def _create_item_row(self, item):
+        row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        row_box.set_margin_start(10)
+        row_box.set_margin_end(10)
+        row_box.set_margin_top(6)
+        row_box.set_margin_bottom(6)
+
+        icon_name = "audio-x-generic-symbolic" if item.get("is_audio") else "video-x-generic-symbolic"
+        img = Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.LARGE_TOOLBAR)
+        row_box.pack_start(img, False, False, 0)
+
+        info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        title_lbl = Gtk.Label()
+        title_lbl.set_markup(f"<b>{GLib.markup_escape_text(item.get('title', 'Tệp ngoại tuyến'))}</b>")
+        title_lbl.set_xalign(0)
+        title_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        info_box.pack_start(title_lbl, False, False, 0)
+
+        sub_lbl = Gtk.Label()
+        size_mb = item.get("size", 0) / (1024 * 1024)
+        ext_str = item.get("ext", "").upper()
+        dur_str = GLib.markup_escape_text(str(item.get("duration", "--:--")))
+        sub_lbl.set_markup(f"<span foreground='#888888'>{GLib.markup_escape_text(item.get('uploader', ''))} • {ext_str} • {size_mb:.1f} MB • {dur_str}</span>")
+        sub_lbl.set_xalign(0)
+        info_box.pack_start(sub_lbl, False, False, 0)
+
+        row_box.pack_start(info_box, True, True, 0)
+
+        btn_play = create_icon_button("media-playback-start-symbolic", "Phát")
+        btn_play.connect("clicked", lambda b, it=item: self._on_play_clicked(it))
+        row_box.pack_start(btn_play, False, False, 0)
+
+        btn_enqueue = create_icon_button("list-add-symbolic", "Hàng đợi")
+        btn_enqueue.connect("clicked", lambda b, it=item: self._on_enqueue_clicked(it))
+        row_box.pack_start(btn_enqueue, False, False, 0)
+
+        btn_delete = create_icon_button("edit-delete-symbolic", "Xóa")
+        btn_delete.connect("clicked", lambda b, it=item: self._on_delete_clicked(it))
+        row_box.pack_start(btn_delete, False, False, 0)
+
+        return row_box
+
+    def _on_play_clicked(self, item):
+        if self.on_play:
+            self.on_play(item)
+        else:
+            launch_vlc(item, is_audio=item.get("is_audio", False))
+
+    def _on_enqueue_clicked(self, item):
+        if self.on_enqueue:
+            self.on_enqueue(item)
+
+    def _on_delete_clicked(self, item):
+        filepath = item.get("path")
+        if filepath and os.path.isfile(filepath):
+            try:
+                os.remove(filepath)
+                stem = os.path.splitext(filepath)[0]
+                for ext in [".info.json", ".jpg", ".webp", ".png"]:
+                    sidecar = f"{stem}{ext}"
+                    if os.path.isfile(sidecar):
+                        os.remove(sidecar)
+            except Exception:
+                pass
+        self.refresh()
+
+
+class DownloadsWidget(Gtk.Box):
+    """Giao diện quản lý các tác vụ tải về đang thực hiện và đã hoàn thành."""
+
+    def __init__(self, download_manager=None):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.dm = download_manager or DownloadManager.get_instance()
+        self.rows = {}
+
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        header.set_margin_start(10)
+        header.set_margin_end(10)
+        header.set_margin_top(8)
+
+        lbl = Gtk.Label()
+        lbl.set_markup("<b>Tiến trình tải xuống</b>")
+        lbl.set_xalign(0)
+        header.pack_start(lbl, True, True, 0)
+
+        btn_clear = create_icon_button("edit-clear-all-symbolic", "Xóa đã xong")
+        btn_clear.connect("clicked", lambda b: self.refresh())
+        header.pack_start(btn_clear, False, False, 0)
+
+        self.pack_start(header, False, False, 0)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.listbox = Gtk.ListBox()
+        self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        scroll.add(self.listbox)
+        self.pack_start(scroll, True, True, 0)
+
+        self.dm.progress_callback = self.on_progress
+        self.refresh()
+
+    def refresh(self):
+        for child in self.listbox.get_children():
+            self.listbox.remove(child)
+        self.rows.clear()
+        tasks = self.dm.get_tasks()
+        if not tasks:
+            empty_lbl = Gtk.Label(label="Chưa có tác vụ tải xuống nào.")
+            empty_lbl.set_margin_top(20)
+            empty_lbl.set_margin_bottom(20)
+            self.listbox.add(empty_lbl)
+            self.listbox.show_all()
+            return
+        for t in tasks:
+            row = self._create_task_row(t)
+            self.rows[t["task_id"]] = row
+            self.listbox.add(row["widget"])
+        self.listbox.show_all()
+
+    def on_progress(self, task_id, percent, speed_str, eta_str):
+        row = self.rows.get(task_id)
+        if not row:
+            self.refresh()
+            return
+        row["pbar"].set_fraction(max(0.0, min(1.0, percent / 100.0)))
+        row["lbl_info"].set_text(f"{percent:.1f}% • {speed_str} • Còn lại: {eta_str}")
+        if percent >= 100.0:
+            row["lbl_status"].set_text("Đã xong")
+            row["btn_cancel"].set_sensitive(False)
+
+    def _create_task_row(self, task):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_margin_start(10)
+        box.set_margin_end(10)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+
+        top_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        title_lbl = Gtk.Label()
+        title_lbl.set_markup(f"<b>{GLib.markup_escape_text(task.get('title', 'Tác vụ'))}</b>")
+        title_lbl.set_xalign(0)
+        title_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        top_box.pack_start(title_lbl, True, True, 0)
+
+        lbl_status = Gtk.Label(label=task.get("status", "queued"))
+        top_box.pack_start(lbl_status, False, False, 0)
+
+        btn_cancel = create_icon_button("process-stop-symbolic", "Hủy")
+        tid = task["task_id"]
+        btn_cancel.connect("clicked", lambda b: self._cancel(tid))
+        if task.get("status") in ("finished", "cancelled", "error"):
+            btn_cancel.set_sensitive(False)
+        top_box.pack_start(btn_cancel, False, False, 0)
+
+        box.pack_start(top_box, False, False, 0)
+
+        pbar = Gtk.ProgressBar()
+        pbar.set_fraction(task.get("percent", 0.0) / 100.0)
+        box.pack_start(pbar, False, False, 0)
+
+        lbl_info = Gtk.Label(label=f"{task.get('percent', 0.0):.1f}% • {task.get('speed_str', '--')} • Còn lại: {task.get('eta_str', '--')}")
+        lbl_info.set_xalign(0)
+        box.pack_start(lbl_info, False, False, 0)
+
+        return {
+            "widget": box,
+            "pbar": pbar,
+            "lbl_info": lbl_info,
+            "lbl_status": lbl_status,
+            "btn_cancel": btn_cancel
+        }
+
+    def _cancel(self, task_id):
+        self.dm.cancel_task(task_id)
+        self.refresh()
+
+
+def parse_channel_playlists_json(data: dict) -> list:
+    """Trích xuất danh sách playlist của kênh từ cấu trúc ytInitialData JSON."""
+    if not isinstance(data, dict):
+        return []
+    playlists = []
+    try:
+        tabs = data.get("contents", {}).get("twoColumnBrowseResultsRenderer", {}).get("tabs", [])
+        for tab in tabs:
+            if not isinstance(tab, dict):
+                continue
+            tab_ren = tab.get("tabRenderer", {})
+            if not isinstance(tab_ren, dict):
+                continue
+            title = tab_ren.get("title", "")
+            content = tab_ren.get("content", {})
+            if not isinstance(content, dict):
+                continue
+            sec_list = content.get("sectionListRenderer", {})
+            if not isinstance(sec_list, dict):
+                continue
+            items = []
+            for sec in sec_list.get("contents", []):
+                if not isinstance(sec, dict):
+                    continue
+                for sub in sec.get("itemSectionRenderer", {}).get("contents", []):
+                    if not isinstance(sub, dict):
+                        continue
+                    grid = sub.get("gridRenderer", {})
+                    if isinstance(grid, dict):
+                        items.extend(grid.get("items", []))
+
+            for it in items:
+                try:
+                    if not isinstance(it, dict):
+                        continue
+                    pl_ren = it.get("gridPlaylistRenderer") or it.get("playlistRenderer")
+                    if not isinstance(pl_ren, dict):
+                        continue
+                    pl_id = pl_ren.get("playlistId", "")
+                    pl_title_obj = pl_ren.get("title")
+                    if isinstance(pl_title_obj, dict):
+                        if "runs" in pl_title_obj and isinstance(pl_title_obj["runs"], list):
+                            pl_title = "".join(r.get("text", "") for r in pl_title_obj["runs"] if isinstance(r, dict))
+                        else:
+                            pl_title = pl_title_obj.get("simpleText", "")
+                    elif pl_title_obj is not None:
+                        pl_title = str(pl_title_obj)
+                    else:
+                        pl_title = ""
+
+                    count_obj = pl_ren.get("videoCountText", pl_ren.get("videoCountShortText"))
+                    if isinstance(count_obj, dict) and "runs" in count_obj and isinstance(count_obj["runs"], list):
+                        cnt_str = "".join(r.get("text", "") for r in count_obj["runs"] if isinstance(r, dict))
+                    elif isinstance(count_obj, dict):
+                        cnt_str = count_obj.get("simpleText", "0")
+                    else:
+                        cnt_str = str(count_obj or 0)
+
+                    try:
+                        count_num = int(re.sub(r"[^\d]", "", cnt_str))
+                    except Exception:
+                        count_num = 0
+
+                    thumb_url = ""
+                    thumb_obj = pl_ren.get("thumbnail")
+                    if isinstance(thumb_obj, dict):
+                        thumbs = thumb_obj.get("thumbnails", [])
+                        if isinstance(thumbs, list) and thumbs:
+                            last_thumb = thumbs[-1]
+                            if isinstance(last_thumb, dict):
+                                thumb_url = last_thumb.get("url", "")
+
+                    if pl_id:
+                        playlists.append({
+                            "playlist_id": pl_id,
+                            "id": pl_id,
+                            "title": pl_title or "Danh sách phát",
+                            "item_count": count_num,
+                            "thumbnail_url": thumb_url,
+                            "thumbnail": thumb_url,
+                            "videos": []
+                        })
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return playlists
+
+
+def fetch_channel_playlists_ytdlp(channel_id: str) -> list:
+    """Lấy danh sách playlist của kênh qua yt-dlp --flat-playlist fallback."""
     env = os.environ.copy()
     env["PATH"] = f"/home/a/.local/bin:{env.get('PATH', '')}"
+    target = f"https://www.youtube.com/channel/{channel_id}/playlists"
+    cmd = [
+        "yt-dlp",
+        "--flat-playlist",
+        "--print", "%(id)s\t%(title)s",
+        target
+    ]
+    node_bin = shutil.which("node") or "/home/a/.local/bin/node"
+    if os.path.exists(node_bin):
+        cmd.extend(["--js-runtimes", f"node:{node_bin}"])
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=25, env=env)
+        results = []
+        for line in proc.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2 and parts[0].strip():
+                pl_id = parts[0].strip()
+                pl_title = parts[1].strip()
+                results.append({
+                    "playlist_id": pl_id,
+                    "id": pl_id,
+                    "title": pl_title,
+                    "item_count": 0,
+                    "thumbnail_url": "",
+                    "thumbnail": "",
+                    "videos": []
+                })
+        return results
+    except Exception:
+        return []
 
-    out_tmpl = os.path.join(download_dir, "%(title)s.%(ext)s")
-    if is_audio:
-        cmd = [
-            "yt-dlp",
-            "--no-playlist",
-            "-x",
-            "--audio-format", "mp3",
-            "-o", out_tmpl,
-            target_url
-        ]
-    else:
-        cmd = [
-            "yt-dlp",
-            "--no-playlist",
-            "-f", f"bestvideo[height<={quality}][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<={quality}]/best",
-            "-o", out_tmpl,
-            target_url
-        ]
 
-    settings = load_settings()
-    if settings.get("sponsorblock", True):
-        sb_cats = get_sponsorblock_categories(settings)
-        if sb_cats:
-            cmd.extend(["--sponsorblock-remove", ",".join(sb_cats)])
+def fetch_channel_playlists(channel_id: str) -> list:
+    """Lấy danh sách playlist của kênh từ YouTube web hoặc yt-dlp."""
+    playlists = []
+    try:
+        url = f"https://www.youtube.com/channel/{channel_id}/playlists"
+        req = urllib.request.Request(url, headers={"User-Agent": UA_PRESETS["Firefox Desktop (Linux)"], "Accept-Language": "vi,en;q=0.9"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html_text = resp.read().decode("utf-8", errors="ignore")
+            m = re.search(r"var ytInitialData\s*=\s*({.+?});</script>", html_text)
+            if m:
+                data = json.loads(m.group(1))
+                playlists = parse_channel_playlists_json(data)
+    except Exception:
+        pass
 
-    def _worker():
-        kind = "Audio MP3" if is_audio else f"Video {quality}p"
-        if status_callback:
-            GLib.idle_add(status_callback, f"Đang tải về [{kind}]: {title[:35]}...")
-        try:
-            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env)
-            if proc.returncode == 0:
-                if status_callback:
-                    GLib.idle_add(status_callback, f"Đã tải xong: {title[:30]} vào {download_dir}")
+    if not playlists:
+        playlists = fetch_channel_playlists_ytdlp(channel_id)
+    return playlists
+
+
+def fetch_playlist_videos(playlist_id: str, limit: int = 50) -> list:
+    """Trích xuất danh sách video bên trong một playlist."""
+    env = os.environ.copy()
+    env["PATH"] = f"/home/a/.local/bin:{env.get('PATH', '')}"
+    cmd = [
+        "yt-dlp",
+        "--flat-playlist",
+        "--playlist-end", str(limit),
+        "--print", "%(id)s\t%(title)s\t%(duration_string)s\t%(uploader)s",
+        f"https://www.youtube.com/playlist?list={playlist_id}"
+    ]
+    node_bin = shutil.which("node") or "/home/a/.local/bin/node"
+    if os.path.exists(node_bin):
+        cmd.extend(["--js-runtimes", f"node:{node_bin}"])
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=30, env=env)
+        videos = []
+        for line in proc.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2 and parts[0].strip():
+                vid_id = parts[0].strip()
+                title = parts[1].strip()
+                dur = parts[2].strip() if len(parts) > 2 and parts[2].strip() else "--:--"
+                uploader = parts[3].strip() if len(parts) > 3 and parts[3].strip() else "YouTube"
+                videos.append({
+                    "id": vid_id,
+                    "title": title,
+                    "duration": dur,
+                    "channel": uploader,
+                    "uploader": uploader,
+                    "url": f"https://www.youtube.com/watch?v={vid_id}",
+                    "thumbnail": f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg"
+                })
+        return videos
+    except Exception:
+        return []
+
+
+# ==============================================================================
+# HÀNG ĐỢI PHÁT (PLAY QUEUE MANAGER)
+# ==============================================================================
+
+class PlayQueueManager:
+    """Quản lý danh sách hàng đợi phát video, điều hướng và chế độ phát lại."""
+
+    _instance = None
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def __init__(self, on_queue_changed=None, on_track_changed=None):
+        if PlayQueueManager._instance is None:
+            PlayQueueManager._instance = self
+        self._lock = threading.RLock()
+        self.items = []
+        self.current_index = -1
+        self.repeat_mode = "off"  # "off", "all", "one"
+        self.shuffle = False
+        self._shuffle_order = []
+        self._shuffle_ptr = -1
+
+        self._queue_listeners = []
+        self._track_listeners = []
+
+        if on_queue_changed:
+            self._queue_listeners.append(on_queue_changed)
+        if on_track_changed:
+            self._track_listeners.append(on_track_changed)
+
+    def add_listener(self, on_queue_changed=None, on_track_changed=None):
+        with self._lock:
+            if on_queue_changed and on_queue_changed not in self._queue_listeners:
+                self._queue_listeners.append(on_queue_changed)
+            if on_track_changed and on_track_changed not in self._track_listeners:
+                self._track_listeners.append(on_track_changed)
+
+    def remove_listener(self, on_queue_changed=None, on_track_changed=None):
+        with self._lock:
+            if on_queue_changed and on_queue_changed in self._queue_listeners:
+                self._queue_listeners.remove(on_queue_changed)
+            if on_track_changed and on_track_changed in self._track_listeners:
+                self._track_listeners.remove(on_track_changed)
+
+    def _notify_queue_changed(self):
+        with self._lock:
+            items_copy = [dict(it) for it in self.items]
+            cur_idx = self.current_index
+            listeners = list(self._queue_listeners)
+        for cb in listeners:
+            try:
+                cb(items_copy, cur_idx)
+            except Exception:
+                pass
+
+    def _notify_track_changed(self, item):
+        with self._lock:
+            listeners = list(self._track_listeners)
+            item_copy = dict(item) if isinstance(item, dict) else item
+        for cb in listeners:
+            try:
+                cb(item_copy)
+            except Exception:
+                pass
+
+    def _generate_shuffle_order(self, preserve_current=True):
+        n = len(self.items)
+        if n == 0:
+            self._shuffle_order = []
+            self._shuffle_ptr = -1
+            return
+        indices = list(range(n))
+        random.shuffle(indices)
+        if preserve_current and 0 <= self.current_index < n:
+            if self.current_index in indices:
+                indices.remove(self.current_index)
+            indices.insert(0, self.current_index)
+            self._shuffle_ptr = 0
+        else:
+            if n > 1 and 0 <= self.current_index < n and indices[0] == self.current_index:
+                indices[0], indices[-1] = indices[-1], indices[0]
+            self._shuffle_ptr = -1
+        self._shuffle_order = indices
+
+    def add_item(self, item_dict: dict, position: str = "end") -> int:
+        with self._lock:
+            item = dict(item_dict)
+            if position == "next":
+                insert_pos = (self.current_index + 1) if self.current_index >= 0 else (1 if self.items else 0)
+                insert_pos = min(insert_pos, len(self.items))
+                self.items.insert(insert_pos, item)
             else:
-                err_msg = proc.stderr.splitlines()[-1] if proc.stderr else "Lỗi không xác định"
-                if status_callback:
-                    GLib.idle_add(status_callback, f"Tải thất bại: {err_msg[:60]}")
-        except Exception as e:
-            if status_callback:
-                GLib.idle_add(status_callback, f"Lỗi tải về: {e}")
+                self.items.append(item)
+            if self.shuffle:
+                self._generate_shuffle_order()
+            total = len(self.items)
+        self._notify_queue_changed()
+        return total
 
-    threading.Thread(target=_worker, daemon=True).start()
+    def add_batch(self, items: list, position: str = "end") -> int:
+        with self._lock:
+            new_items = [dict(it) for it in items]
+            if not new_items:
+                return len(self.items)
+            if position == "next":
+                insert_pos = (self.current_index + 1) if self.current_index >= 0 else (1 if self.items else 0)
+                insert_pos = min(insert_pos, len(self.items))
+                for idx, it in enumerate(new_items):
+                    self.items.insert(insert_pos + idx, it)
+            else:
+                self.items.extend(new_items)
+            if self.shuffle:
+                self._generate_shuffle_order()
+            total = len(self.items)
+        self._notify_queue_changed()
+        return total
+
+    def remove_item(self, index: int):
+        with self._lock:
+            if not (0 <= index < len(self.items)):
+                return None
+            removed = self.items.pop(index)
+            if index < self.current_index:
+                self.current_index -= 1
+            elif index == self.current_index:
+                if self.current_index >= len(self.items):
+                    self.current_index = len(self.items) - 1
+            if len(self.items) == 0:
+                self.current_index = -1
+            if self.shuffle:
+                self._generate_shuffle_order()
+        self._notify_queue_changed()
+        return removed
+
+    def clear(self):
+        with self._lock:
+            self.items.clear()
+            self.current_index = -1
+            self._shuffle_order.clear()
+            self._shuffle_ptr = -1
+        self._notify_queue_changed()
+        self._notify_track_changed(None)
+
+    def get_items(self) -> list:
+        with self._lock:
+            return [dict(it) for it in self.items]
+
+    def get_current_item(self):
+        with self._lock:
+            if 0 <= self.current_index < len(self.items):
+                return dict(self.items[self.current_index])
+            if self.current_index == -1 and self.items:
+                return dict(self.items[0])
+            return None
+
+    def jump_to(self, index: int):
+        with self._lock:
+            if not (0 <= index < len(self.items)):
+                return None
+            self.current_index = index
+            if self.shuffle:
+                if self.current_index in self._shuffle_order:
+                    self._shuffle_ptr = self._shuffle_order.index(self.current_index)
+                else:
+                    self._generate_shuffle_order()
+            item = dict(self.items[self.current_index])
+        self._notify_track_changed(item)
+        self._notify_queue_changed()
+        return item
+
+    def next_track(self, force_advance=False):
+        with self._lock:
+            if not self.items:
+                return None
+            if not force_advance and self.repeat_mode == "one" and 0 <= self.current_index < len(self.items):
+                item = dict(self.items[self.current_index])
+                self._notify_track_changed(item)
+                return item
+
+            if self.shuffle:
+                if not self._shuffle_order or len(self._shuffle_order) != len(self.items):
+                    self._generate_shuffle_order()
+                next_ptr = self._shuffle_ptr + 1
+                if next_ptr >= len(self._shuffle_order):
+                    if self.repeat_mode in ("all", "one"):
+                        self._generate_shuffle_order(preserve_current=False)
+                        next_ptr = 0
+                    else:
+                        self._shuffle_ptr = len(self._shuffle_order)
+                        return None
+                self._shuffle_ptr = next_ptr
+                self.current_index = self._shuffle_order[self._shuffle_ptr]
+            else:
+                next_idx = self.current_index + 1
+                if next_idx >= len(self.items):
+                    if self.repeat_mode in ("all", "one"):
+                        next_idx = 0
+                    else:
+                        return None
+                self.current_index = next_idx
+            item = dict(self.items[self.current_index])
+        self._notify_track_changed(item)
+        self._notify_queue_changed()
+        return item
+
+    def prev_track(self, force_advance=False):
+        with self._lock:
+            if not self.items:
+                return None
+            if not force_advance and self.repeat_mode == "one" and 0 <= self.current_index < len(self.items):
+                item = dict(self.items[self.current_index])
+                self._notify_track_changed(item)
+                return item
+
+            if self.shuffle:
+                if not self._shuffle_order or len(self._shuffle_order) != len(self.items):
+                    self._generate_shuffle_order()
+                prev_ptr = self._shuffle_ptr - 1
+                if prev_ptr < 0:
+                    if self.repeat_mode in ("all", "one"):
+                        prev_ptr = len(self._shuffle_order) - 1
+                    else:
+                        prev_ptr = 0
+                self._shuffle_ptr = prev_ptr
+                self.current_index = self._shuffle_order[self._shuffle_ptr]
+            else:
+                prev_idx = self.current_index - 1
+                if prev_idx < 0:
+                    if self.repeat_mode in ("all", "one"):
+                        prev_idx = len(self.items) - 1
+                    else:
+                        prev_idx = 0
+                self.current_index = prev_idx
+            item = dict(self.items[self.current_index])
+        self._notify_track_changed(item)
+        self._notify_queue_changed()
+        return item
+
+    def set_repeat_mode(self, mode: str):
+        with self._lock:
+            if mode in ("off", "all", "one"):
+                self.repeat_mode = mode
+        self._notify_queue_changed()
+
+    def get_repeat_mode(self) -> str:
+        with self._lock:
+            return self.repeat_mode
+
+    def cycle_repeat_mode(self) -> str:
+        with self._lock:
+            order = ["off", "all", "one"]
+            cur = order.index(self.repeat_mode) if self.repeat_mode in order else 0
+            self.repeat_mode = order[(cur + 1) % len(order)]
+            mode = self.repeat_mode
+        self._notify_queue_changed()
+        return mode
+
+    def set_shuffle(self, enabled: bool):
+        with self._lock:
+            self.shuffle = bool(enabled)
+            if self.shuffle:
+                self._generate_shuffle_order()
+            else:
+                self._shuffle_order.clear()
+                self._shuffle_ptr = -1
+        self._notify_queue_changed()
+
+    def get_shuffle(self) -> bool:
+        with self._lock:
+            return self.shuffle
+
+    def toggle_shuffle(self) -> bool:
+        with self._lock:
+            self.set_shuffle(not self.shuffle)
+            return self.shuffle
+
+    # Aliases
+    add = add_item
+    add_next = lambda self, item: self.add_item(item, position="next")
+    add_end = lambda self, item: self.add_item(item, position="end")
+    remove = remove_item
+    get_current = get_current_item
 
 
 # ==============================================================================
@@ -2063,13 +3211,17 @@ class ChannelRow(Gtk.ListBoxRow):
 
 class VideoRow(Gtk.ListBoxRow):
     """Widget thẻ Video: Tối ưu với logo kênh, thống kê like/dislike (không emoji), và nút mũi tên xem chi tiết."""
-    def __init__(self, video, on_play_callback, on_channel_click=None, on_download_callback=None, progress_data=None):
+    def __init__(self, video, on_play_callback, on_channel_click=None, on_download_callback=None, progress_data=None, on_queue_callback=None):
         super().__init__()
         self.video = video
         self.on_play_callback = on_play_callback
         self.on_channel_click = on_channel_click
         self.on_download_callback = on_download_callback
+        self.on_queue_callback = on_queue_callback
         self.dearrow_thumb_loaded = False
+
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.connect("button-press-event", self._on_button_press)
 
         hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
         hbox.set_margin_start(10)
@@ -2242,15 +3394,81 @@ class VideoRow(Gtk.ListBoxRow):
         vbox.pack_start(info_box, False, False, 0)
         hbox.pack_start(vbox, True, True, 0)
 
-        # 3. Nút mũi tên xem chi tiết & phát video (Giao diện tinh gọn chỉ 1 nút mũi tên)
+        # 3. Nút phát tiếp theo, thêm vào hàng đợi & xem chi tiết
         arrow_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         arrow_box.set_valign(Gtk.Align.CENTER)
+
+        self.btn_play_next = create_icon_button("media-skip-forward-symbolic", None, tooltip="Phát tiếp theo")
+        self.btn_play_next.connect("clicked", lambda b: self._handle_enqueue("next"))
+        arrow_box.pack_start(self.btn_play_next, False, False, 0)
+
+        self.btn_add_queue = create_icon_button("list-add-symbolic", None, tooltip="Thêm vào hàng đợi")
+        self.btn_add_queue.connect("clicked", lambda b: self._handle_enqueue("end"))
+        arrow_box.pack_start(self.btn_add_queue, False, False, 0)
+
+        self.btn_play_audio = create_icon_button("audio-x-generic-symbolic", None, tooltip="Phát chỉ âm thanh")
+        self.btn_play_audio.connect("clicked", lambda b: self._handle_play_audio())
+        arrow_box.pack_start(self.btn_play_audio, False, False, 0)
+
         self.arrow_btn = create_icon_button("go-next-symbolic", None, tooltip="Xem chi tiết, bình luận & phát video")
         self.arrow_btn.connect("clicked", lambda b: self.open_detail_dialog())
         arrow_box.pack_start(self.arrow_btn, False, False, 0)
         hbox.pack_end(arrow_box, False, False, 0)
 
         self.add(hbox)
+
+    def _handle_play_audio(self):
+        if self.on_play_callback:
+            try:
+                self.on_play_callback(self.video, quality_override="audio", is_audio=True)
+            except TypeError:
+                self.on_play_callback(self.video)
+
+    def _handle_enqueue(self, position="end"):
+        if self.on_queue_callback:
+            self.on_queue_callback(self.video, position=position)
+            return
+        top = self.get_toplevel()
+        if hasattr(top, "enqueue_video"):
+            top.enqueue_video(self.video, position=position)
+        elif hasattr(top, "get_transient_for"):
+            parent = top.get_transient_for()
+            if parent and hasattr(parent, "enqueue_video"):
+                parent.enqueue_video(self.video, position=position)
+
+    def _on_button_press(self, widget, event):
+        if event.button == 3:  # Chuột phải (Context menu)
+            menu = Gtk.Menu()
+
+            item_play = Gtk.MenuItem(label="Phát video")
+            if self.on_play_callback:
+                item_play.connect("activate", lambda w: self.on_play_callback(self.video))
+            menu.append(item_play)
+
+            item_audio = Gtk.MenuItem(label="Phát âm thanh (Audio-only)")
+            item_audio.connect("activate", lambda w: self._handle_play_audio())
+            menu.append(item_audio)
+
+            item_next = Gtk.MenuItem(label="Phát tiếp theo")
+            item_next.connect("activate", lambda w: self._handle_enqueue("next"))
+            menu.append(item_next)
+
+            item_queue = Gtk.MenuItem(label="Thêm vào hàng đợi")
+            item_queue.connect("activate", lambda w: self._handle_enqueue("end"))
+            menu.append(item_queue)
+
+            item_copy = Gtk.MenuItem(label="Sao chép liên kết")
+            item_copy.connect("activate", lambda w: self._copy_video_link())
+            menu.append(item_copy)
+
+            item_detail = Gtk.MenuItem(label="Xem chi tiết")
+            item_detail.connect("activate", lambda w: self.open_detail_dialog())
+            menu.append(item_detail)
+
+            menu.show_all()
+            menu.popup(None, None, None, None, event.button, event.time)
+            return True
+        return False
 
     def open_detail_dialog(self):
         parent = self.get_toplevel()
@@ -2260,7 +3478,8 @@ class VideoRow(Gtk.ListBoxRow):
             parent, self.video,
             on_play_callback=self.on_play_callback,
             on_download_callback=self.on_download_callback,
-            on_channel_click=self.on_channel_click
+            on_channel_click=self.on_channel_click,
+            on_queue_callback=self.on_queue_callback or (lambda v, position="end": self._handle_enqueue(position))
         )
         dlg.run()
         dlg.destroy()
@@ -2292,7 +3511,7 @@ class VideoRow(Gtk.ListBoxRow):
 
 class VideoDetailDialog(Gtk.Dialog):
     """Cửa sổ hiển thị đầy đủ chi tiết video: logo kênh, tên kênh, mô tả, bình luận, like/dislike, sao chép link và phát video."""
-    def __init__(self, parent, video, on_play_callback=None, on_download_callback=None, on_channel_click=None):
+    def __init__(self, parent, video, on_play_callback=None, on_download_callback=None, on_channel_click=None, on_queue_callback=None):
         super().__init__(
             title="Chi tiết Video",
             transient_for=parent,
@@ -2304,6 +3523,7 @@ class VideoDetailDialog(Gtk.Dialog):
         self.on_play_callback = on_play_callback
         self.on_download_callback = on_download_callback
         self.on_channel_click = on_channel_click
+        self.on_queue_callback = on_queue_callback
 
         self.add_button("Đóng", Gtk.ResponseType.CLOSE)
 
@@ -2369,13 +3589,25 @@ class VideoDetailDialog(Gtk.Dialog):
         self.stats_lbl.set_xalign(0)
         content.pack_start(self.stats_lbl, False, False, 0)
 
-        # 4. Hàng nút thao tác: Phát, Sao chép link, Tải về
+        # 4. Hàng nút thao tác: Phát, Phát tiếp theo, Thêm vào hàng đợi, Sao chép link, Tải về
         act_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
 
         if self.on_play_callback:
             btn_play = create_icon_button("media-playback-start-symbolic", "Phát video", css_class="suggested-action")
             btn_play.connect("clicked", lambda b: (self.response(Gtk.ResponseType.CLOSE), self.on_play_callback(self.video)))
             act_box.pack_start(btn_play, False, False, 0)
+
+            btn_audio = create_icon_button("audio-x-generic-symbolic", "Phát âm thanh")
+            btn_audio.connect("clicked", lambda b: (self.response(Gtk.ResponseType.CLOSE), self._play_audio()))
+            act_box.pack_start(btn_audio, False, False, 0)
+
+        btn_play_next = create_icon_button("media-skip-forward-symbolic", "Phát tiếp theo")
+        btn_play_next.connect("clicked", lambda b: (self._handle_enqueue("next"), self.status_lbl.set_text("Đã thêm vào phát tiếp theo.")))
+        act_box.pack_start(btn_play_next, False, False, 0)
+
+        btn_add_queue = create_icon_button("list-add-symbolic", "Thêm vào hàng đợi")
+        btn_add_queue.connect("clicked", lambda b: (self._handle_enqueue("end"), self.status_lbl.set_text("Đã thêm vào hàng đợi phát.")))
+        act_box.pack_start(btn_add_queue, False, False, 0)
 
         self.btn_copy = create_icon_button("edit-copy-symbolic", "Sao chép link video")
         self.btn_copy.connect("clicked", self._copy_link)
@@ -2441,6 +3673,18 @@ class VideoDetailDialog(Gtk.Dialog):
 
         content.show_all()
         self._load_data()
+
+    def _handle_enqueue(self, position="end"):
+        if self.on_queue_callback:
+            self.on_queue_callback(self.video, position=position)
+            return
+        parent = self.get_transient_for()
+        if parent and hasattr(parent, "enqueue_video"):
+            parent.enqueue_video(self.video, position=position)
+        elif parent and hasattr(parent, "get_transient_for"):
+            top = parent.get_transient_for()
+            if top and hasattr(top, "enqueue_video"):
+                top.enqueue_video(self.video, position=position)
 
     def _copy_link(self, btn):
         url = f"https://youtu.be/{self.vid_id}" if self.vid_id else self.video.get("url", "")
@@ -2546,8 +3790,210 @@ class VideoDetailDialog(Gtk.Dialog):
 
         self.comments_list.show_all()
 
+    def _play_audio(self):
+        if self.on_play_callback:
+            try:
+                self.on_play_callback(self.video, quality_override="audio", is_audio=True)
+            except TypeError:
+                self.on_play_callback(self.video)
+
 
 CommentsDialog = VideoDetailDialog
+VideoItemWidget = VideoRow
+
+
+# ==============================================================================
+# WIDGET HÀNG ĐỢI PHÁT (PLAY QUEUE WIDGET)
+# ==============================================================================
+
+class PlayQueueWidget(Gtk.Box):
+    """Widget giao diện Hàng đợi phát (Play Queue) với danh sách cuộn và thanh điều khiển."""
+
+    def __init__(self, queue_manager, main_window):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.set_margin_start(12)
+        self.set_margin_end(12)
+        self.set_margin_top(12)
+        self.set_margin_bottom(12)
+
+        self.qm = queue_manager
+        self.win = main_window
+
+        # Top Control Bar
+        top_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.lbl_count = Gtk.Label()
+        self.lbl_count.set_markup("<b>Hàng đợi phát (0 video):</b>")
+        self.lbl_count.set_xalign(0)
+        top_bar.pack_start(self.lbl_count, False, False, 0)
+
+        # Control buttons
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+        self.btn_prev = create_icon_button("media-skip-backward-symbolic", None, tooltip="Bài trước")
+        self.btn_prev.connect("clicked", lambda b: self.win.play_prev_in_queue(manual=True))
+        btn_box.pack_start(self.btn_prev, False, False, 0)
+
+        self.btn_next = create_icon_button("media-skip-forward-symbolic", None, tooltip="Bài tiếp theo")
+        self.btn_next.connect("clicked", lambda b: self.win.play_next_in_queue(manual=True))
+        btn_box.pack_start(self.btn_next, False, False, 0)
+
+        self.btn_shuffle = create_icon_button("media-playlist-shuffle-symbolic", "Trộn bài", tooltip="Bật/Tắt xáo trộn")
+        self.btn_shuffle.connect("clicked", lambda b: self._toggle_shuffle())
+        btn_box.pack_start(self.btn_shuffle, False, False, 0)
+
+        self.btn_repeat = create_icon_button("media-playlist-repeat-symbolic", "Lặp: Tắt", tooltip="Chuyển chế độ lặp (Tắt -> Tất cả -> 1 bài)")
+        self.btn_repeat.connect("clicked", lambda b: self._cycle_repeat())
+        btn_box.pack_start(self.btn_repeat, False, False, 0)
+
+        self.btn_clear = create_icon_button("user-trash-symbolic", "Xóa hàng đợi", tooltip="Xóa toàn bộ hàng đợi phát")
+        self.btn_clear.connect("clicked", lambda b: self.win.clear_queue_action())
+        btn_box.pack_start(self.btn_clear, False, False, 0)
+
+        top_bar.pack_end(btn_box, False, False, 0)
+        self.pack_start(top_bar, False, False, 0)
+
+        # Scrolled queue list
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.listbox = Gtk.ListBox()
+        self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        scroll.add(self.listbox)
+        self.pack_start(scroll, True, True, 0)
+
+        # Register listener to PlayQueueManager
+        self.qm.add_listener(
+            on_queue_changed=lambda items, idx: GLib.idle_add(self._render_queue, items, idx),
+            on_track_changed=lambda item: GLib.idle_add(self._on_track_changed, item)
+        )
+        self._render_queue(self.qm.get_items(), self.qm.current_index)
+
+    def _toggle_shuffle(self):
+        new_state = not self.qm.get_shuffle()
+        self.qm.set_shuffle(new_state)
+        self.win.set_status(f"Chế độ trộn bài: {'Bật' if new_state else 'Tắt'}")
+
+    def _cycle_repeat(self):
+        new_mode = self.qm.cycle_repeat_mode()
+        labels = {"off": "Tắt", "all": "Tất cả", "one": "1 bài"}
+        self.win.set_status(f"Chế độ lặp lại: {labels.get(new_mode, new_mode)}")
+
+    def _on_track_changed(self, item):
+        self._render_queue(self.qm.get_items(), self.qm.current_index)
+
+    def _render_queue(self, items, current_idx):
+        for child in self.listbox.get_children():
+            self.listbox.remove(child)
+
+        count = len(items)
+        self.lbl_count.set_markup(f"<b>Hàng đợi phát ({count} video):</b>")
+
+        # Update repeat & shuffle buttons state/label
+        rep = self.qm.get_repeat_mode()
+        rep_labels = {"off": "Lặp: Tắt", "all": "Lặp: Tất cả", "one": "Lặp: 1 bài"}
+        label_text = rep_labels.get(rep, "Lặp: Tắt")
+        child = self.btn_repeat.get_child()
+        if isinstance(child, Gtk.Box):
+            for w in child.get_children():
+                if isinstance(w, Gtk.Label):
+                    w.set_text(label_text)
+                    break
+        self.btn_repeat.set_tooltip_text(f"Chế độ lặp: {label_text}")
+        if rep != "off":
+            self.btn_repeat.get_style_context().add_class("suggested-action")
+        else:
+            self.btn_repeat.get_style_context().remove_class("suggested-action")
+
+        shuf = self.qm.get_shuffle()
+        if shuf:
+            self.btn_shuffle.get_style_context().add_class("suggested-action")
+        else:
+            self.btn_shuffle.get_style_context().remove_class("suggested-action")
+
+        if not items:
+            empty_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            empty_box.set_margin_top(40)
+            lbl_empty = Gtk.Label()
+            lbl_empty.set_markup("<span size='large' foreground='#888888'><b>Hàng đợi phát đang trống</b></span>\n<span foreground='#666666'>Thêm video từ kết quả tìm kiếm, thịnh hành hoặc kênh bằng nút 'Thêm vào hàng đợi'.</span>")
+            lbl_empty.set_justify(Gtk.Justification.CENTER)
+            empty_box.pack_start(lbl_empty, False, False, 0)
+            self.listbox.add(empty_box)
+            self.listbox.show_all()
+            return
+
+        for idx, item in enumerate(items):
+            row = Gtk.ListBoxRow()
+            is_active = (idx == current_idx)
+
+            hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            hbox.set_margin_start(8)
+            hbox.set_margin_end(8)
+            hbox.set_margin_top(6)
+            hbox.set_margin_bottom(6)
+
+            # Index label or playing indicator
+            idx_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            idx_box.set_size_request(32, -1)
+            idx_box.set_valign(Gtk.Align.CENTER)
+            if is_active:
+                play_ico = Gtk.Image.new_from_icon_name("media-playback-start-symbolic", Gtk.IconSize.MENU)
+                idx_box.pack_start(play_ico, True, True, 0)
+            else:
+                lbl_num = Gtk.Label(label=f"{idx + 1}.")
+                lbl_num.set_xalign(0.5)
+                idx_box.pack_start(lbl_num, True, True, 0)
+            hbox.pack_start(idx_box, False, False, 0)
+
+            # Thumbnail (80x45)
+            thumb_img = Gtk.Image.new_from_pixbuf(get_placeholder_pixbuf(80, 45))
+            thumb_img.set_size_request(80, 45)
+            hbox.pack_start(thumb_img, False, False, 0)
+            vid_id = item.get("id")
+            if vid_id:
+                request_thumbnail_async(vid_id, lambda pb, img=thumb_img: img.set_from_pixbuf(pb) if pb and img else None, width=80, height=45)
+
+            # Title and channel / duration
+            vbox_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            vbox_info.set_valign(Gtk.Align.CENTER)
+
+            title = item.get("title", "Video")
+            lbl_title = Gtk.Label()
+            if is_active:
+                lbl_title.set_markup(f"<span foreground='#3daee9'><b>{GLib.markup_escape_text(title)}</b></span>")
+            else:
+                lbl_title.set_markup(f"<b>{GLib.markup_escape_text(title)}</b>")
+            lbl_title.set_line_wrap(True)
+            lbl_title.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            lbl_title.set_max_width_chars(50)
+            lbl_title.set_xalign(0)
+            vbox_info.pack_start(lbl_title, False, False, 0)
+
+            channel = item.get("channel") or item.get("uploader") or "YouTube"
+            dur = item.get("duration", "--:--")
+            audio_tag = " • [Audio]" if item.get("is_audio") else ""
+            lbl_sub = Gtk.Label()
+            lbl_sub.set_markup(f"<span foreground='#aaaaaa' size='small'>{GLib.markup_escape_text(channel)} • {dur}{audio_tag}</span>")
+            lbl_sub.set_xalign(0)
+            vbox_info.pack_start(lbl_sub, False, False, 0)
+
+            hbox.pack_start(vbox_info, True, True, 0)
+
+            # Action buttons: Play item, Remove item
+            btn_play_item = create_icon_button("media-playback-start-symbolic", None, tooltip="Phát bài này")
+            btn_play_item.set_valign(Gtk.Align.CENTER)
+            btn_play_item.connect("clicked", lambda b, i=idx: self.win.play_queue_item(i))
+            hbox.pack_end(btn_play_item, False, False, 0)
+
+            btn_del_item = create_icon_button("edit-delete-symbolic", None, tooltip="Xóa khỏi hàng đợi")
+            btn_del_item.set_valign(Gtk.Align.CENTER)
+            btn_del_item.connect("clicked", lambda b, i=idx: self.win.remove_queue_item(i))
+            hbox.pack_end(btn_del_item, False, False, 0)
+
+            row.add(hbox)
+            if is_active:
+                row.get_style_context().add_class("queue-playing-row")
+            self.listbox.add(row)
+
+        self.listbox.show_all()
 
 
 # ==============================================================================
@@ -2570,8 +4016,8 @@ class ChannelVideosDialog(Gtk.Dialog):
         self.on_subs_changed = on_subs_changed
         self.download_callback = download_callback
         self.channel_meta = {}
-        self.tab_cache = {"featured": None, "videos": None, "shorts": None}
-        self.tab_loading = {"featured": False, "videos": False, "shorts": False}
+        self.tab_cache = {"featured": None, "videos": None, "shorts": None, "playlists": None}
+        self.tab_loading = {"featured": False, "videos": False, "shorts": False, "playlists": False}
 
         self.add_button("Đóng", Gtk.ResponseType.CLOSE)
 
@@ -2619,7 +4065,7 @@ class ChannelVideosDialog(Gtk.Dialog):
 
         content.pack_start(header_box, False, False, 0)
 
-        # 2. Gtk.Notebook 3 Tab: "Trang chủ", "Video", "Shorts"
+        # 2. Gtk.Notebook 4 Tab: "Trang chủ", "Video", "Shorts", "Danh sách phát"
         self.notebook = Gtk.Notebook()
         self.notebook.set_margin_start(8)
         self.notebook.set_margin_end(8)
@@ -2636,6 +4082,10 @@ class ChannelVideosDialog(Gtk.Dialog):
         # TAB 3: SHORTS
         self.shorts_vbox = self._create_shorts_tab()
         self.notebook.append_page(self.shorts_vbox, create_tab_label("media-playlist-repeat-symbolic", "Shorts"))
+
+        # TAB 4: DANH SÁCH PHÁT (PLAYLISTS)
+        self.playlists_vbox = self._create_playlists_tab()
+        self.notebook.append_page(self.playlists_vbox, create_tab_label("view-list-symbolic", "Danh sách phát"))
 
         self.notebook.connect("switch-page", self._on_tab_switched)
         content.pack_start(self.notebook, True, True, 0)
@@ -2774,8 +4224,37 @@ class ChannelVideosDialog(Gtk.Dialog):
         vbox.pack_start(scroll, True, True, 0)
         return vbox
 
+    def _create_playlists_tab(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        toolbar.set_margin_start(10)
+        toolbar.set_margin_end(10)
+        toolbar.set_margin_top(8)
+
+        self.playlists_filter_entry = Gtk.SearchEntry()
+        self.playlists_filter_entry.set_placeholder_text("Lọc danh sách phát...")
+        self.playlists_filter_entry.connect("search-changed", lambda e: self._redraw_playlists())
+        toolbar.pack_start(self.playlists_filter_entry, True, True, 0)
+
+        btn_refresh = create_icon_button("view-refresh-symbolic", "Tải lại")
+        btn_refresh.connect("clicked", lambda b: self._reload_tab("playlists"))
+        toolbar.pack_start(btn_refresh, False, False, 0)
+
+        self.playlists_spinner = Gtk.Spinner()
+        toolbar.pack_start(self.playlists_spinner, False, False, 0)
+
+        vbox.pack_start(toolbar, False, False, 0)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.playlists_list = Gtk.ListBox()
+        self.playlists_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        scroll.add(self.playlists_list)
+        vbox.pack_start(scroll, True, True, 0)
+        return vbox
+
     def _on_tab_switched(self, notebook, page, page_num):
-        tab_names = ["featured", "videos", "shorts"]
+        tab_names = ["featured", "videos", "shorts", "playlists"]
         if 0 <= page_num < len(tab_names):
             t_name = tab_names[page_num]
             if not self.tab_cache.get(t_name):
@@ -2791,9 +4270,14 @@ class ChannelVideosDialog(Gtk.Dialog):
             self.videos_spinner.start()
         elif tab_type == "shorts" and hasattr(self, "shorts_spinner"):
             self.shorts_spinner.start()
+        elif tab_type == "playlists" and hasattr(self, "playlists_spinner"):
+            self.playlists_spinner.start()
 
         def _worker():
-            res = fetch_channel_tab_data(self.channel_id, tab_type=tab_type)
+            if tab_type == "playlists":
+                res = {"playlists": fetch_channel_playlists(self.channel_id)}
+            else:
+                res = fetch_channel_tab_data(self.channel_id, tab_type=tab_type)
             GLib.idle_add(self._on_tab_loaded, tab_type, res)
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -2808,6 +4292,8 @@ class ChannelVideosDialog(Gtk.Dialog):
             self.videos_spinner.stop()
         elif tab_type == "shorts" and hasattr(self, "shorts_spinner"):
             self.shorts_spinner.stop()
+        elif tab_type == "playlists" and hasattr(self, "playlists_spinner"):
+            self.playlists_spinner.stop()
 
         if not data:
             self.status_lbl.set_text(f"Không thể tải nội dung tab {tab_type}.")
@@ -2824,6 +4310,8 @@ class ChannelVideosDialog(Gtk.Dialog):
             self._redraw_videos()
         elif tab_type == "shorts":
             self._redraw_shorts()
+        elif tab_type == "playlists":
+            self._redraw_playlists()
 
         self.status_lbl.set_text(f"Đã cập nhật dữ liệu kênh: {self.channel_name}")
 
@@ -2965,6 +4453,92 @@ class ChannelVideosDialog(Gtk.Dialog):
                 row = VideoRow(s, self.play_callback, on_download_callback=self.download_callback, progress_data=p_data)
                 self.shorts_list.add(row)
         self.shorts_list.show_all()
+
+    def _redraw_playlists(self):
+        for c in self.playlists_list.get_children():
+            self.playlists_list.remove(c)
+        data = self.tab_cache.get("playlists")
+        playlists = data.get("playlists", []) if isinstance(data, dict) else (data or [])
+        if not playlists:
+            lbl = Gtk.Label(label="Chưa có danh sách phát hoặc đang tải...")
+            lbl.set_margin_top(20)
+            self.playlists_list.add(lbl)
+            self.playlists_list.show_all()
+            return
+
+        kw = self.playlists_filter_entry.get_text().strip().lower()
+        if kw:
+            playlists = [p for p in playlists if kw in p.get("title", "").lower()]
+
+        if not playlists:
+            lbl = Gtk.Label(label="Không có danh sách phát nào khớp với bộ lọc.")
+            lbl.set_margin_top(20)
+            self.playlists_list.add(lbl)
+        else:
+            for pl in playlists:
+                row = self._create_playlist_row(pl)
+                self.playlists_list.add(row)
+        self.playlists_list.show_all()
+
+    def _create_playlist_row(self, pl):
+        row = Gtk.ListBoxRow()
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        hbox.set_margin_start(10)
+        hbox.set_margin_end(10)
+        hbox.set_margin_top(8)
+        hbox.set_margin_bottom(8)
+
+        img = Gtk.Image.new_from_pixbuf(get_placeholder_pixbuf(120, 68))
+        img.set_size_request(120, 68)
+        thumb = pl.get("thumbnail") or pl.get("thumbnail_url")
+        if thumb:
+            request_image_async(thumb, lambda pb, i=img: i.set_from_pixbuf(pb) if pb and i else None, 120, 68)
+        hbox.pack_start(img, False, False, 0)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        vbox.set_valign(Gtk.Align.CENTER)
+
+        title_lbl = Gtk.Label()
+        title_lbl.set_markup(f"<b>{GLib.markup_escape_text(pl.get('title', 'Danh sách phát'))}</b>")
+        title_lbl.set_line_wrap(True)
+        title_lbl.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        title_lbl.set_xalign(0)
+        vbox.pack_start(title_lbl, False, False, 0)
+
+        cnt = pl.get("item_count", 0)
+        cnt_lbl = Gtk.Label()
+        cnt_lbl.set_markup(f"<span foreground='#aaaaaa' size='small'>{cnt} video</span>")
+        cnt_lbl.set_xalign(0)
+        vbox.pack_start(cnt_lbl, False, False, 0)
+
+        hbox.pack_start(vbox, True, True, 0)
+
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        btn_box.set_valign(Gtk.Align.CENTER)
+
+        pl_id = pl.get("playlist_id") or pl.get("id")
+
+        btn_enqueue = create_icon_button("media-playlist-consecutive-symbolic", "Phát tất cả", css_class="suggested-action")
+        btn_enqueue.connect("clicked", lambda b, pid=pl_id: self._enqueue_entire_playlist(pid))
+        btn_box.pack_start(btn_enqueue, False, False, 0)
+
+        hbox.pack_end(btn_box, False, False, 0)
+        row.add(hbox)
+        return row
+
+    def _enqueue_entire_playlist(self, playlist_id):
+        self.status_lbl.set_text(f"Đang lấy danh sách video trong playlist {playlist_id}...")
+        def _worker():
+            videos = fetch_playlist_videos(playlist_id)
+            def _apply():
+                if videos:
+                    pq = PlayQueueManager.get_instance()
+                    added = pq.add_batch(videos)
+                    self.status_lbl.set_text(f"Đã thêm {added} video từ playlist vào hàng đợi.")
+                else:
+                    self.status_lbl.set_text("Không tìm thấy video nào trong playlist.")
+            GLib.idle_add(_apply)
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _on_videos_scroll_changed(self, adj):
         if not self.settings.get("auto_load_more", True):
@@ -3109,12 +4683,20 @@ class MainWindow(Gtk.Window):
         self.current_feed_videos = []
         self.feed_sort_mode = "newest"
 
+        # Trạng thái hàng đợi phát
+        self.queue_manager = PlayQueueManager()
+        self.is_playing_queue = False
+        self._playback_token = 0
+
         # Khởi tạo các Tab
         self._init_search_tab()
         self._init_explore_tab()
         self._init_feed_tab()
         self._init_history_tab()
         self._init_subs_manager_tab()
+        self._init_queue_tab()
+        self._init_downloads_tab()
+        self._init_offline_tab()
         self._init_settings_tab()
 
         # Kết nối chuyển tab để nạp dữ liệu lười (lazy load), tránh nghẽn CPU lúc mở app
@@ -3251,6 +4833,10 @@ class MainWindow(Gtk.Window):
                 padding: 8px;
                 background-color: #2a2e32;
             }
+            .queue-playing-row {
+                background-color: rgba(61, 174, 233, 0.22);
+                border-left: 4px solid #3daee9;
+            }
             """
         else:
             css = b"""
@@ -3336,6 +4922,10 @@ class MainWindow(Gtk.Window):
                 padding: 8px;
                 background-color: #f8f9fa;
             }
+            .queue-playing-row {
+                background-color: rgba(61, 174, 233, 0.15);
+                border-left: 4px solid #3daee9;
+            }
             """
         if hasattr(self, "css_provider") and self.css_provider:
             self.css_provider.load_from_data(css)
@@ -3387,6 +4977,8 @@ class MainWindow(Gtk.Window):
         else:
             quality = self.settings.get("quality", "720")
 
+        stop_vlc()
+        self.is_playing_queue = False
         launch_vlc(
             video, self.settings, quality_override=quality,
             status_callback=self.set_status,
@@ -3404,11 +4996,118 @@ class MainWindow(Gtk.Window):
         elif curr_page == 2:
             self._redraw_feed_list()
 
+    def _init_queue_tab(self):
+        """Khởi tạo tab Hàng đợi phát trong MainWindow."""
+        self.queue_widget = PlayQueueWidget(self.queue_manager, self)
+        self.notebook.append_page(self.queue_widget, create_tab_label("media-playlist-consecutive-symbolic", "Hàng đợi phát"))
+
+    def _init_downloads_tab(self):
+        """Khởi tạo tab Quản lý tải xuống."""
+        self.downloads_widget = DownloadsWidget()
+        self.notebook.append_page(self.downloads_widget, create_tab_label("folder-download-symbolic", "Tải xuống"))
+
+    def _init_offline_tab(self):
+        """Khởi tạo tab Thư viện ngoại tuyến."""
+        self.offline_widget = OfflineLibraryWidget(on_play=self.play_offline_media, on_enqueue=self.enqueue_video)
+        self.notebook.append_page(self.offline_widget, create_tab_label("drive-harddisk-symbolic", "Thư viện ngoại tuyến"))
+
+    def play_offline_media(self, item):
+        """Phát tệp media ngoại tuyến trên VLC."""
+        launch_vlc_local(item, settings=self.settings, status_callback=self.set_status)
+
+    def reload_queue_ui(self):
+        """Cập nhật giao diện danh sách hàng đợi phát."""
+        if hasattr(self, "queue_widget"):
+            self.queue_widget._render_queue(self.queue_manager.get_items(), self.queue_manager.current_index)
+
+    def enqueue_video(self, video, position="end", play_if_idle=False, is_audio=False):
+        """Thêm video vào hàng đợi phát."""
+        entry = dict(video)
+        if is_audio:
+            entry["is_audio"] = True
+        new_len = self.queue_manager.add_item(entry, position=position)
+        pos_str = "phát tiếp theo" if position == "next" else "hàng đợi"
+        self.set_status(f"Đã thêm vào {pos_str} ({new_len} video): {video.get('title', '')[:30]}")
+        if play_if_idle and not self.is_playing_queue and self.queue_manager.current_index == -1:
+            self.play_queue_item(0)
+
+    def play_queue_item(self, index: int):
+        """Phát video tại vị trí index trong hàng đợi."""
+        item = self.queue_manager.jump_to(index)
+        if item:
+            self.start_queue_playback(item)
+
+    def play_next_in_queue(self, manual=False):
+        """Chuyển và tự động phát bài kế tiếp trong hàng đợi."""
+        item = self.queue_manager.next_track(force_advance=manual)
+        if item:
+            self.start_queue_playback(item)
+        else:
+            self.is_playing_queue = False
+            self.set_status("Hàng đợi đã phát xong.")
+
+    def play_prev_in_queue(self, manual=False):
+        """Quay lại và phát bài trước đó trong hàng đợi."""
+        item = self.queue_manager.prev_track(force_advance=manual)
+        if item:
+            self.start_queue_playback(item)
+
+    def remove_queue_item(self, index: int):
+        """Xóa một bài khỏi hàng đợi."""
+        was_playing = (index == self.queue_manager.current_index)
+        removed = self.queue_manager.remove_item(index)
+        if was_playing:
+            if self.queue_manager.current_index >= 0:
+                self.play_queue_item(self.queue_manager.current_index)
+            else:
+                stop_vlc()
+                self.is_playing_queue = False
+        if removed:
+            self.set_status(f"Đã xóa khỏi hàng đợi: {removed.get('title', '')[:30]}")
+
+    def clear_queue_action(self):
+        """Xóa toàn bộ hàng đợi phát."""
+        stop_vlc()
+        self.is_playing_queue = False
+        self.queue_manager.clear()
+        self.set_status("Đã xóa toàn bộ hàng đợi phát.")
+
+    def start_queue_playback(self, item):
+        """Khởi động VLC phát một video từ hàng đợi kèm cờ --play-and-exit và auto-advance."""
+        stop_vlc()
+        self.is_playing_queue = True
+        self._playback_token += 1
+        token = self._playback_token
+
+        is_audio = item.get("is_audio", False)
+        quality = "audio" if is_audio else self.settings.get("quality", "720")
+
+        launch_vlc(
+            item, self.settings, quality_override=quality,
+            status_callback=self.set_status,
+            on_playback_done=lambda vid: self._on_queue_item_done(vid, token),
+            in_queue=True,
+            is_audio=is_audio
+        )
+        GLib.idle_add(self.reload_history)
+
+    def _on_queue_item_done(self, vid_id, token):
+        """Xử lý khi video trong hàng đợi kết thúc phát -> tự động phát tiếp."""
+        if token != self._playback_token:
+            return  # Bỏ qua callback từ phiên phát cũ đã bị thay thế
+        self._on_playback_completed(vid_id)
+        GLib.idle_add(self.play_next_in_queue)
+
     def download_video_action(self, video, quality="720", is_audio=False):
         """Kích hoạt tải video hoặc audio."""
-        download_media(video, quality=quality, is_audio=is_audio,
+        task_id = download_media(video, quality=quality, is_audio=is_audio,
                        download_dir=self.settings.get("download_dir"),
                        status_callback=self.set_status)
+        if hasattr(self, "downloads_widget") and self.downloads_widget:
+            self.downloads_widget.refresh()
+        title = video.get("title", "Video") if isinstance(video, dict) else str(video)
+        self.set_status(f"Đã thêm vào hàng đợi tải xuống: {title[:40]}")
+        return task_id
 
     def open_channel_videos(self, channel_id, channel_name):
         """Mở cửa sổ xem video trong kênh."""
@@ -3623,7 +5322,8 @@ class MainWindow(Gtk.Window):
                     r, self.play_video_action,
                     on_channel_click=self.open_channel_videos,
                     on_download_callback=lambda v: self.download_video_action(v, self.settings.get("quality", "720")),
-                    progress_data=prog_map.get(r.get("id"), {})
+                    progress_data=prog_map.get(r.get("id"), {}),
+                    on_queue_callback=self.enqueue_video
                 )
                 self.search_list.add(row)
 
@@ -3766,7 +5466,8 @@ class MainWindow(Gtk.Window):
                     v, self.play_video_action,
                     on_channel_click=self.open_channel_videos,
                     on_download_callback=lambda vid: self.download_video_action(vid, self.settings.get("quality", "720")),
-                    progress_data=prog_map.get(v.get("id"), {})
+                    progress_data=prog_map.get(v.get("id"), {}),
+                    on_queue_callback=self.enqueue_video
                 )
                 self.explore_list.add(row)
         self.explore_list.show_all()
@@ -3877,7 +5578,8 @@ class MainWindow(Gtk.Window):
                 v, self.play_video_action,
                 on_channel_click=self.open_channel_videos,
                 on_download_callback=lambda vid: self.download_video_action(vid, self.settings.get("quality", "720")),
-                progress_data=prog_map.get(v.get("id"), {})
+                progress_data=prog_map.get(v.get("id"), {}),
+                on_queue_callback=self.enqueue_video
             )
             self.feed_list.add(row)
         self.feed_list.show_all()
@@ -3931,7 +5633,8 @@ class MainWindow(Gtk.Window):
                 h, self.play_video_action,
                 on_channel_click=self.open_channel_videos,
                 on_download_callback=lambda vid: self.download_video_action(vid, self.settings.get("quality", "720")),
-                progress_data=prog_map.get(h.get("id"), {})
+                progress_data=prog_map.get(h.get("id"), {}),
+                on_queue_callback=self.enqueue_video
             )
             self.history_list.add(row)
         self.history_list.show_all()
