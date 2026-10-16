@@ -74,6 +74,13 @@ DEFAULT_SETTINGS = {
     "user_agent": "Android TV (Khuyên dùng)",
     "ask_quality": True,
     "sponsorblock": True,
+    "sb_sponsor": True,
+    "sb_intro": True,
+    "sb_outro": True,
+    "sb_selfpromo": True,
+    "sb_interaction": True,
+    "sb_preview": True,
+    "return_youtube_dislike": True,
     "dearrow": True,
     "auto_load_more": True,
     "download_dir": os.path.expanduser("~/Downloads"),
@@ -421,35 +428,62 @@ def sort_videos(videos, mode="newest"):
 
 _sponsorblock_cache = {}
 _dearrow_cache = {}
-
+_stats_cache = {}
 
 dearrow_executor = ThreadPoolExecutor(max_workers=3)
+stats_executor = ThreadPoolExecutor(max_workers=3)
 
 
-def fetch_sponsorblock_segments(video_id):
+def get_sponsorblock_categories(settings=None):
+    """Lấy danh sách các danh mục SponsorBlock được người dùng bật trong Cài đặt."""
+    if not settings:
+        settings = load_settings()
+    cats = []
+    if settings.get("sb_sponsor", True):
+        cats.append("sponsor")
+    if settings.get("sb_intro", True):
+        cats.append("intro")
+    if settings.get("sb_outro", True):
+        cats.append("outro")
+    if settings.get("sb_selfpromo", True):
+        cats.append("selfpromo")
+    if settings.get("sb_interaction", True):
+        cats.append("interaction")
+    if settings.get("sb_preview", True):
+        cats.append("preview")
+    return cats or ["sponsor"]
+
+
+def fetch_sponsorblock_segments(video_id, categories=None):
+    """Lấy danh sách phân đoạn quảng cáo / giới thiệu từ SponsorBlock API."""
     if not video_id:
         return []
-    if video_id in _sponsorblock_cache:
-        return _sponsorblock_cache[video_id]
-    categories = '["sponsor","intro","outro","selfpromo","interaction"]'
-    url = f"https://sponsor.ajay.app/api/skipSegments?videoID={video_id}&categories={urllib.parse.quote(categories)}"
+    if categories is None:
+        categories = get_sponsorblock_categories()
+    cache_key = f"{video_id}_{','.join(sorted(categories))}"
+    if cache_key in _sponsorblock_cache:
+        return _sponsorblock_cache[cache_key]
+    cat_json = json.dumps(categories)
+    url = f"https://sponsor.ajay.app/api/skipSegments?videoID={video_id}&categories={urllib.parse.quote(cat_json)}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     segments = []
     try:
-        with urllib.request.urlopen(req, timeout=2.0) as resp:
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
             data = json.loads(resp.read().decode())
         for item in data:
             seg = item.get("segment")
             cat = item.get("category", "sponsor")
             if seg and len(seg) == 2:
                 segments.append((float(seg[0]), float(seg[1]), cat))
+        segments.sort(key=lambda s: s[0])
     except Exception:
         pass
-    _sponsorblock_cache[video_id] = segments
+    _sponsorblock_cache[cache_key] = segments
     return segments
 
 
 def fetch_dearrow_info(video_id):
+    """Lấy tiêu đề sạch và thumbnail timestamp từ DeArrow API."""
     if not video_id:
         return None
     if video_id in _dearrow_cache:
@@ -457,18 +491,18 @@ def fetch_dearrow_info(video_id):
     url = f"https://sponsor.ajay.app/api/branding?videoID={video_id}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
-        with urllib.request.urlopen(req, timeout=2.0) as resp:
+        with urllib.request.urlopen(req, timeout=4.0) as resp:
             data = json.loads(resp.read().decode())
         title = None
-        for t in data.get("titles", []):
-            if not t.get("original") and t.get("title"):
-                title = t["title"]
-                break
+        non_orig_titles = [t for t in data.get("titles", []) if not t.get("original") and t.get("title")]
+        if non_orig_titles:
+            non_orig_titles.sort(key=lambda x: x.get("votes", 0), reverse=True)
+            title = non_orig_titles[0]["title"]
         thumb_time = None
-        for th in data.get("thumbnails", []):
-            if not th.get("original") and th.get("timestamp") is not None:
-                thumb_time = th["timestamp"]
-                break
+        non_orig_thumbs = [th for th in data.get("thumbnails", []) if not th.get("original") and th.get("timestamp") is not None]
+        if non_orig_thumbs:
+            non_orig_thumbs.sort(key=lambda x: x.get("votes", 0), reverse=True)
+            thumb_time = non_orig_thumbs[0]["timestamp"]
         res = {"title": title, "timestamp": thumb_time}
         _dearrow_cache[video_id] = res
         return res
@@ -478,7 +512,7 @@ def fetch_dearrow_info(video_id):
 
 
 def request_dearrow_async(video_id, on_title_cb=None, on_thumb_cb=None):
-    """Lấy tiêu đề và ảnh bìa DeArrow bất đồng bộ trong background thread, không block UI."""
+    """Lấy tiêu đề và ảnh bìa DeArrow bất đồng bộ, chỉ cập nhật khi tải thành công (không xóa ảnh gốc)."""
     def _worker():
         d_info = fetch_dearrow_info(video_id)
         if not d_info:
@@ -487,8 +521,156 @@ def request_dearrow_async(video_id, on_title_cb=None, on_thumb_cb=None):
             GLib.idle_add(on_title_cb, d_info["title"])
         if on_thumb_cb and d_info.get("timestamp") is not None:
             dearrow_url = f"https://dearrow-thumb.ajay.app/api/v1/getThumbnail?videoID={video_id}&time={d_info['timestamp']}"
-            fetch_and_load_image(dearrow_url, 160, 90, on_thumb_cb, is_avatar=False)
+            try:
+                import hashlib
+                h = hashlib.md5(dearrow_url.encode("utf-8")).hexdigest()
+                path = os.path.join(THUMB_DIR, f"{h}.jpg")
+                if not (os.path.exists(path) and os.path.getsize(path) > 200):
+                    req = urllib.request.Request(dearrow_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=5.0) as resp:
+                        img_data = resp.read()
+                    if img_data and len(img_data) > 200:
+                        with open(path, "wb") as f:
+                            f.write(img_data)
+                if os.path.exists(path) and os.path.getsize(path) > 200:
+                    pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, 160, 90, False)
+                    if pb:
+                        GLib.idle_add(on_thumb_cb, pb)
+            except Exception:
+                pass
     dearrow_executor.submit(_worker)
+
+
+def format_compact_number(n):
+    """Định dạng số lớn thành định dạng gọn gàng K/M."""
+    try:
+        n = int(n)
+        if n >= 1_000_000:
+            return f"{n / 1_000_000:.1f}M".replace(".0M", "M")
+        if n >= 1_000:
+            return f"{n / 1_000:.1f}K".replace(".0K", "K")
+        return str(n)
+    except Exception:
+        return str(n)
+
+
+_details_cache = {}
+
+
+def fetch_video_stats(video_id):
+    """Lấy số lượt Like, Dislike và Đánh giá từ Return YouTube Dislike API."""
+    if not video_id:
+        return None
+    settings = load_settings()
+    if not settings.get("return_youtube_dislike", True):
+        return None
+    if video_id in _stats_cache:
+        return _stats_cache[video_id]
+    url = f"https://returnyoutubedislikeapi.com/votes?videoId={video_id}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=3.5) as resp:
+            data = json.loads(resp.read().decode())
+            res = {
+                "likes": data.get("likes", 0),
+                "dislikes": data.get("dislikes", 0),
+                "rating": data.get("rating", 0.0),
+                "view_count": data.get("viewCount", 0)
+            }
+            _stats_cache[video_id] = res
+            return res
+    except Exception:
+        return None
+
+
+def fetch_video_details_fast(video_id):
+    """Lấy thông tin mô tả chi tiết của video qua yt-dlp mà không tải video."""
+    if not video_id:
+        return {}
+    if video_id in _details_cache:
+        return _details_cache[video_id]
+    try:
+        import yt_dlp
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": True,
+            "extractor_args": {"youtube": {"player_client": ["tv_embedded", "android"]}}
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False, process=False)
+            res = {
+                "title": info.get("title", ""),
+                "channel": info.get("channel") or info.get("uploader", ""),
+                "description": info.get("description", ""),
+                "duration": info.get("duration"),
+                "view_count": info.get("view_count"),
+            }
+            _details_cache[video_id] = res
+            return res
+    except Exception:
+        return {}
+
+
+def fetch_video_comments_fast(video_id, max_count=35):
+    """Trích xuất danh sách bình luận hàng đầu của video qua yt-dlp extractor mà không tải video."""
+    if not video_id:
+        return []
+    comments = []
+    try:
+        import yt_dlp
+        ydl_opts = {"quiet": True, "no_warnings": True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ie = ydl.get_info_extractor("Youtube")
+            cont = ie._generate_comment_continuation(video_id)
+            resp = ie._extract_response(item_id=video_id, query={"continuation": cont}, ep="next", fatal=False)
+            if not resp:
+                return []
+
+            mutations = resp.get("frameworkUpdates", {}).get("entityBatchUpdate", {}).get("mutations", [])
+            model_map = {}
+            for m in mutations:
+                p = m.get("payload", {})
+                if "commentEntityPayload" in p:
+                    c_id = p["commentEntityPayload"].get("properties", {}).get("commentId")
+                    if c_id:
+                        model_map[c_id] = p["commentEntityPayload"]
+
+            endpoints = resp.get("onResponseReceivedEndpoints", [])
+            for ep in endpoints:
+                cmd = ep.get("reloadContinuationItemsCommand") or ep.get("appendContinuationItemsAction")
+                if not cmd:
+                    continue
+                for item in cmd.get("continuationItems", []):
+                    ct = item.get("commentThreadRenderer")
+                    if not ct:
+                        continue
+                    cr = ct.get("comment", {}).get("commentRenderer")
+                    cvm = ct.get("commentViewModel", {}).get("commentViewModel")
+                    if cr:
+                        author = cr.get("authorText", {}).get("simpleText", "")
+                        text = "".join(r.get("text", "") for r in cr.get("contentText", {}).get("runs", []))
+                        likes = cr.get("voteCount", {}).get("simpleText", "0")
+                        time_str = cr.get("publishedTimeText", {}).get("runs", [{}])[0].get("text", "")
+                        thumbs = cr.get("authorThumbnail", {}).get("thumbnails", [])
+                        avatar = thumbs[-1]["url"] if thumbs else None
+                        comments.append({"author": author, "text": text, "likes": likes, "time": time_str, "avatar": avatar})
+                    elif cvm:
+                        cid = cvm.get("commentId")
+                        c_payload = model_map.get(cid, {})
+                        author = c_payload.get("author", {}).get("displayName") or cvm.get("authorName", "")
+                        text = c_payload.get("properties", {}).get("content", {}).get("content", "")
+                        likes = c_payload.get("toolbar", {}).get("likeCountNotliked") or "0"
+                        time_str = c_payload.get("properties", {}).get("publishedTime", "")
+                        avatar = c_payload.get("author", {}).get("avatarThumbnailUrl")
+                        comments.append({"author": author, "text": text, "likes": likes, "time": time_str, "avatar": avatar})
+                    if len(comments) >= max_count:
+                        break
+                if len(comments) >= max_count:
+                    break
+    except Exception:
+        pass
+    return comments
 
 
 # ==============================================================================
@@ -730,17 +912,28 @@ def extract_stream_url(video_id_or_url, quality="720", player_client="tv_embedde
 def monitor_vlc_rc(port, video_id, segments, status_callback=None, on_playback_done=None):
     """Kết nối điều khiển từ xa VLC để tự bỏ qua quảng cáo SponsorBlock và ghi nhận tiến trình xem."""
     sock = None
-    for _ in range(16):
-        time.sleep(0.3)
+    for _ in range(30):
+        time.sleep(0.5)
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(1.2)
+            s.settimeout(1.5)
             s.connect(('127.0.0.1', port))
             sock = s
-            try:
-                sock.recv(1024)
-            except Exception:
-                pass
+            # Xả sạch toàn bộ banner ban đầu của giao diện Lua CLI cho tới khi gặp dấu nhắc lệnh '> '
+            buf = b""
+            t_start = time.time()
+            while time.time() - t_start < 2.0:
+                try:
+                    d = sock.recv(1024)
+                    if not d:
+                        break
+                    buf += d
+                    if b"> " in buf:
+                        break
+                except socket.timeout:
+                    break
+                except Exception:
+                    break
             break
         except Exception:
             pass
@@ -752,47 +945,60 @@ def monitor_vlc_rc(port, video_id, segments, status_callback=None, on_playback_d
     total_length = 0
     skipped_indices = set()
 
+    def _exec_rc(cmd_str):
+        try:
+            sock.sendall((cmd_str + "\n").encode())
+            ans = b""
+            t0 = time.time()
+            while time.time() - t0 < 0.6:
+                try:
+                    chunk = sock.recv(256)
+                    if not chunk:
+                        break
+                    ans += chunk
+                    if b"> " in ans or b"\n" in ans:
+                        break
+                except socket.timeout:
+                    break
+            return ans.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+
     try:
         while True:
             time.sleep(0.8)
             # 1. Đo thời gian hiện tại
-            try:
-                sock.sendall(b"get_time\n")
-                resp = sock.recv(256).decode("utf-8", errors="ignore")
-                m = re.search(r"(\d+)", resp)
-                if m:
-                    cur_time = int(m.group(1))
-                    if cur_time > 0:
-                        last_watched = cur_time
-                        # Kiểm tra phân đoạn SponsorBlock
-                        if segments:
-                            for idx, (s_start, s_end, cat) in enumerate(segments):
-                                if idx not in skipped_indices and s_start <= cur_time < s_end:
-                                    skip_target = int(s_end + 1)
-                                    sock.sendall(f"seek {skip_target}\n".encode())
-                                    skipped_indices.add(idx)
-                                    dur = int(s_end - s_start)
-                                    if status_callback:
-                                        GLib.idle_add(
-                                            status_callback,
-                                            f"⏩ [SponsorBlock] Tự động bỏ qua đoạn tài trợ ({dur} giây)"
-                                        )
-                                    break
-            except Exception:
+            resp = _exec_rc("get_time")
+            if not resp and not sock:
                 break
+            m = re.search(r"(\d+)", resp)
+            if m:
+                cur_time = int(m.group(1))
+                if cur_time > 0:
+                    last_watched = cur_time
+                    # Kiểm tra phân đoạn SponsorBlock
+                    if segments:
+                        for idx, (s_start, s_end, cat) in enumerate(segments):
+                            if idx not in skipped_indices and s_start <= cur_time < s_end:
+                                skip_target = int(s_end + 1)
+                                _exec_rc(f"seek {skip_target}")
+                                skipped_indices.add(idx)
+                                dur = int(s_end - s_start)
+                                if status_callback:
+                                    GLib.idle_add(
+                                        status_callback,
+                                        f"[SponsorBlock] Bỏ qua đoạn tài trợ ({dur} giây)"
+                                    )
+                                break
 
             # 2. Lấy tổng độ dài nếu chưa có
             if total_length <= 0:
-                try:
-                    sock.sendall(b"get_length\n")
-                    resp_len = sock.recv(256).decode("utf-8", errors="ignore")
-                    m_len = re.search(r"(\d+)", resp_len)
-                    if m_len:
-                        t_len = int(m_len.group(1))
-                        if t_len > 0:
-                            total_length = t_len
-                except Exception:
-                    pass
+                resp_len = _exec_rc("get_length")
+                m_len = re.search(r"(\d+)", resp_len)
+                if m_len:
+                    t_len = int(m_len.group(1))
+                    if t_len > 0:
+                        total_length = t_len
     except Exception:
         pass
     finally:
@@ -816,7 +1022,7 @@ def launch_vlc(video, settings, quality_override=None, status_callback=None, on_
         ua_string = get_ua_string(settings)
 
         if status_callback:
-            GLib.idle_add(status_callback, f"⏳ Đang kết nối luồng {quality}p: {title[:40]}...")
+            GLib.idle_add(status_callback, f"Đang kết nối luồng {quality}p: {title[:40]}...")
 
         video_url, audio_url = extract_stream_url(
             target_url,
@@ -827,7 +1033,7 @@ def launch_vlc(video, settings, quality_override=None, status_callback=None, on_
 
         if not video_url:
             if status_callback:
-                GLib.idle_add(status_callback, "❌ Không thể phát video. Vui lòng thử video khác!")
+                GLib.idle_add(status_callback, "Không thể phát video. Vui lòng thử video khác!")
             return
 
         caching = settings.get("caching", 3000)
@@ -836,7 +1042,8 @@ def launch_vlc(video, settings, quality_override=None, status_callback=None, on_
         # SponsorBlock: Kiểm tra phân đoạn
         segments = []
         if settings.get("sponsorblock", True) and vid_id:
-            segments = fetch_sponsorblock_segments(vid_id)
+            sb_cats = get_sponsorblock_categories(settings)
+            segments = fetch_sponsorblock_segments(vid_id, categories=sb_cats)
 
         vlc_cmd = [
             "vlc",
@@ -864,7 +1071,7 @@ def launch_vlc(video, settings, quality_override=None, status_callback=None, on_
             vlc_cmd.extend(["--avcodec-hw=none", "--avcodec-skiploopfilter=4"])
 
         if status_callback:
-            GLib.idle_add(status_callback, f"▶ Đang phát {quality}p trên VLC: {title[:40]}")
+            GLib.idle_add(status_callback, f"Đang phát {quality}p trên VLC: {title[:40]}")
 
         add_to_history(video)
 
@@ -921,24 +1128,26 @@ def download_media(video, quality="720", is_audio=False, download_dir=None, stat
 
     settings = load_settings()
     if settings.get("sponsorblock", True):
-        cmd.extend(["--sponsorblock-remove", "sponsor,intro,outro,selfpromo,interaction"])
+        sb_cats = get_sponsorblock_categories(settings)
+        if sb_cats:
+            cmd.extend(["--sponsorblock-remove", ",".join(sb_cats)])
 
     def _worker():
         kind = "Audio MP3" if is_audio else f"Video {quality}p"
         if status_callback:
-            GLib.idle_add(status_callback, f"⏳ Đang tải về [{kind}]: {title[:35]}...")
+            GLib.idle_add(status_callback, f"Đang tải về [{kind}]: {title[:35]}...")
         try:
             proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env)
             if proc.returncode == 0:
                 if status_callback:
-                    GLib.idle_add(status_callback, f"✅ Đã tải xong: {title[:30]} vào {download_dir}")
+                    GLib.idle_add(status_callback, f"Đã tải xong: {title[:30]} vào {download_dir}")
             else:
                 err_msg = proc.stderr.splitlines()[-1] if proc.stderr else "Lỗi không xác định"
                 if status_callback:
-                    GLib.idle_add(status_callback, f"❌ Tải thất bại: {err_msg[:60]}")
+                    GLib.idle_add(status_callback, f"Tải thất bại: {err_msg[:60]}")
         except Exception as e:
             if status_callback:
-                GLib.idle_add(status_callback, f"❌ Lỗi tải về: {e}")
+                GLib.idle_add(status_callback, f"Lỗi tải về: {e}")
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -1064,15 +1273,16 @@ def fetch_channel_videos_ytdlp(channel_id, limit=50):
     return videos
 
 
-def fetch_channel_videos_web(channel_id):
-    """Trích xuất thông tin kênh và danh sách video trực tiếp từ web YouTube."""
+def fetch_channel_tab_data(channel_id, tab_type="videos"):
+    """Trích xuất thông tin kênh và danh sách nội dung theo từng tab: Trang chủ (featured), Video (videos), Shorts (shorts)."""
     channel_id = channel_id.strip()
+    clean_tab = tab_type if tab_type in ["featured", "videos", "shorts"] else "videos"
     if channel_id.startswith("http"):
-        url = channel_id.rstrip("/") + "/videos"
+        url = f"{channel_id.rstrip('/')}/{clean_tab}"
     elif channel_id.startswith("@"):
-        url = f"https://www.youtube.com/{channel_id}/videos"
+        url = f"https://www.youtube.com/{channel_id}/{clean_tab}"
     else:
-        url = f"https://www.youtube.com/channel/{channel_id}/videos"
+        url = f"https://www.youtube.com/channel/{channel_id}/{clean_tab}"
 
     req = urllib.request.Request(url, headers={
         "User-Agent": UA_PRESETS["Firefox Desktop (Linux)"],
@@ -1129,6 +1339,16 @@ def fetch_channel_videos_web(channel_id):
             elif "video" in text.lower():
                 video_count = text
 
+    # Mô tả / giới thiệu kênh ("loại của chủ kênh")
+    desc = ""
+    desc_vm = ph.get("content", {}).get("pageHeaderViewModel", {}).get(
+        "description", {}).get("descriptionPreviewViewModel", {})
+    if desc_vm:
+        desc = desc_vm.get("description", {}).get("content", "")
+    if not desc:
+        mf = data.get("microformat", {}).get("microformatDataRenderer", {})
+        desc = mf.get("description", "")
+
     actual_cid = channel_id
     microformat = data.get("microformat", {}).get("microformatDataRenderer", {})
     canonical_url = microformat.get("urlCanonical", "")
@@ -1143,26 +1363,70 @@ def fetch_channel_videos_web(channel_id):
         "handle": handle,
         "subscribers": subscribers,
         "video_count": video_count,
+        "description": desc,
         "verified": True
     }
 
-    # Danh sách video
+    # Tab contents
+    featured_video = None
     videos = []
     tabs = data.get("contents", {}).get("twoColumnBrowseResultsRenderer", {}).get("tabs", [])
-    video_tab = None
+    selected_tab = None
     for t in tabs:
         tr = t.get("tabRenderer", {})
-        if tr.get("selected") or tr.get("title") in ["Video", "Videos"]:
-            video_tab = tr
+        if tr.get("selected"):
+            selected_tab = tr
             break
-    if not video_tab and len(tabs) > 1:
-        video_tab = tabs[1].get("tabRenderer", {})
+    if not selected_tab and tabs:
+        selected_tab = tabs[0].get("tabRenderer", {})
 
-    grid = video_tab.get("content", {}).get("richGridRenderer", {}) if video_tab else {}
-    items = grid.get("contents", [])
-    for it in items:
-        vm = it.get("richItemRenderer", {}).get("content", {}).get("lockupViewModel")
-        vr = it.get("richItemRenderer", {}).get("content", {}).get("videoRenderer")
+    content = selected_tab.get("content", {}) if selected_tab else {}
+
+    # Nếu tab là featured (Trang chủ): Lấy video giới thiệu / trailer nổi bật
+    if clean_tab == "featured":
+        sec_list = content.get("sectionListRenderer", {}).get("contents", [])
+        for sec in sec_list:
+            for itm in sec.get("itemSectionRenderer", {}).get("contents", []):
+                if "channelVideoPlayerRenderer" in itm:
+                    cvp = itm["channelVideoPlayerRenderer"]
+                    f_id = cvp.get("videoId")
+                    f_title = "".join(r.get("text", "") for r in cvp.get("title", {}).get("runs", []))
+                    f_desc = "".join(r.get("text", "") for r in cvp.get("description", {}).get("runs", []))
+                    f_views = cvp.get("viewCountText", {}).get("simpleText", "")
+                    f_pub = cvp.get("publishedTimeText", {}).get("simpleText", "")
+                    if f_id and f_title:
+                        featured_video = {
+                            "id": f_id,
+                            "title": f_title,
+                            "description": f_desc,
+                            "channel": title or channel_id,
+                            "channel_id": actual_cid,
+                            "channel_avatar": avatar,
+                            "views": f_views,
+                            "published": f_pub,
+                            "duration": "--:--",
+                            "is_short": False
+                        }
+                        break
+            if featured_video:
+                break
+
+    # Trích xuất danh sách video từ grid / shelves
+    grid_items = []
+    if "richGridRenderer" in content:
+        grid_items.extend(content["richGridRenderer"].get("contents", []))
+    elif "sectionListRenderer" in content:
+        for sec in content["sectionListRenderer"].get("contents", []):
+            for itm in sec.get("itemSectionRenderer", {}).get("contents", []):
+                if "shelfRenderer" in itm:
+                    vlist = itm["shelfRenderer"].get("content", {}).get("verticalListRenderer", {}).get("items", [])
+                    grid_items.extend(vlist)
+
+    for it in grid_items:
+        vm = it.get("richItemRenderer", {}).get("content", {}).get("lockupViewModel") or it.get("lockupViewModel")
+        vr = it.get("richItemRenderer", {}).get("content", {}).get("videoRenderer") or it.get("videoRenderer")
+        slvm = it.get("richItemRenderer", {}).get("content", {}).get("shortsLockupViewModel") or it.get("shortsLockupViewModel")
+
         if vm:
             vid_id = vm.get("contentId")
             meta = vm.get("metadata", {}).get("lockupMetadataViewModel", {})
@@ -1184,15 +1448,18 @@ def fetch_channel_videos_web(channel_id):
             views = parts[0] if len(parts) > 0 else ""
             pub = parts[1] if len(parts) > 1 else ""
             if vid_id and vtitle:
+                is_short = (clean_tab == "shorts" or "#shorts" in vtitle.lower() or (":" in dur and len(dur.split(":")) == 2 and dur.replace(":", "").isdigit() and int(dur.split(":")[0]) * 60 + int(dur.split(":")[1]) <= 60))
                 videos.append({
                     "id": vid_id,
                     "title": vtitle,
                     "channel": title or channel_id,
                     "channel_id": actual_cid,
+                    "channel_avatar": avatar,
                     "uploader": title or channel_id,
-                    "duration": dur,
+                    "duration": "Shorts" if is_short and dur == "--:--" else dur,
                     "published": pub,
-                    "views": views
+                    "views": views,
+                    "is_short": is_short
                 })
         elif vr:
             vid_id = vr.get("videoId")
@@ -1201,18 +1468,45 @@ def fetch_channel_videos_web(channel_id):
             pub = vr.get("publishedTimeText", {}).get("simpleText", "")
             views = vr.get("viewCountText", {}).get("simpleText", "")
             if vid_id and vtitle:
+                is_short = (clean_tab == "shorts" or "#shorts" in vtitle.lower() or (":" in dur and len(dur.split(":")) == 2 and dur.replace(":", "").isdigit() and int(dur.split(":")[0]) * 60 + int(dur.split(":")[1]) <= 60))
                 videos.append({
                     "id": vid_id,
                     "title": vtitle,
                     "channel": title or channel_id,
                     "channel_id": actual_cid,
+                    "channel_avatar": avatar,
                     "uploader": title or channel_id,
-                    "duration": dur,
+                    "duration": "Shorts" if is_short and dur == "--:--" else dur,
                     "published": pub,
-                    "views": views
+                    "views": views,
+                    "is_short": is_short
+                })
+        elif slvm:
+            vid_id = slvm.get("onTap", {}).get("innertubeCommand", {}).get("reelWatchEndpoint", {}).get("videoId")
+            if not vid_id:
+                vid_id = slvm.get("entityId", "").replace("shorts-shelf-item-", "")
+            vtitle = slvm.get("overlayMetadata", {}).get("primaryText", {}).get("content") or slvm.get("accessibilityText", "")
+            views = slvm.get("overlayMetadata", {}).get("secondaryText", {}).get("content", "")
+            if vid_id and vtitle:
+                videos.append({
+                    "id": vid_id,
+                    "title": vtitle,
+                    "channel": title or channel_id,
+                    "channel_id": actual_cid,
+                    "channel_avatar": avatar,
+                    "uploader": title or channel_id,
+                    "duration": "Shorts",
+                    "published": "",
+                    "views": views,
+                    "is_short": True
                 })
 
-    return {"channel": channel_meta, "videos": videos}
+    return {"channel": channel_meta, "videos": videos, "featured_video": featured_video}
+
+
+def fetch_channel_videos_web(channel_id):
+    """Trích xuất danh sách video tải lên thông thường của kênh (tương thích ngược)."""
+    return fetch_channel_tab_data(channel_id, tab_type="videos")
 
 
 def search_youtube_fast(query, limit=30):
@@ -1294,12 +1588,15 @@ def search_youtube_fast(query, limit=30):
                             cid = None
                             if owner_runs and 'navigationEndpoint' in owner_runs[0]:
                                 cid = owner_runs[0]['navigationEndpoint'].get('browseEndpoint', {}).get('browseId')
-                            if not cid:
-                                cid = v.get('channelThumbnailSupportedRenderers', {}).get(
-                                    'channelThumbnailWithLinkRenderer', {}).get(
-                                    'navigationEndpoint', {}).get('browseEndpoint', {}).get('browseId')
+                            chan_thumb = v.get('channelThumbnailSupportedRenderers', {}).get(
+                                'channelThumbnailWithLinkRenderer', {}).get('thumbnail', {}).get('thumbnails', [])
+                            chan_avatar = chan_thumb[-1]['url'] if chan_thumb else None
+                            if chan_avatar and chan_avatar.startswith('//'):
+                                chan_avatar = 'https:' + chan_avatar
+
                             pub = v.get('publishedTimeText', {}).get('simpleText', '')
                             views = v.get('viewCountText', {}).get('simpleText', '')
+                            is_short = ('#shorts' in title.lower() or (':' in dur and len(dur.split(':')) == 2 and dur.replace(':', '').isdigit() and int(dur.split(':')[0]) * 60 + int(dur.split(':')[1]) <= 60))
 
                             videos.append({
                                 'id': vid_id,
@@ -1307,12 +1604,59 @@ def search_youtube_fast(query, limit=30):
                                 'uploader': uploader,
                                 'channel': uploader,
                                 'channel_id': cid,
-                                'duration': dur,
+                                'channel_avatar': chan_avatar,
+                                'duration': 'Shorts' if is_short and dur == '--:--' else dur,
                                 'published': pub,
                                 'views': views,
-                                'type': 'video'
+                                'type': 'video',
+                                'is_short': is_short
                             })
                             existing_vid_ids.add(vid_id)
+
+                    # Trích xuất Shorts từ kệ YouTube (gridShelfViewModel, reelShelfRenderer, v.v.)
+                    shorts_items = []
+                    if 'gridShelfViewModel' in item:
+                        shorts_items.extend(item['gridShelfViewModel'].get('contents', []))
+                    elif 'reelShelfRenderer' in item:
+                        shorts_items.extend(item['reelShelfRenderer'].get('items', []))
+                    elif 'richShelfRenderer' in item:
+                        shorts_items.extend(item['richShelfRenderer'].get('contents', []))
+                    elif 'shelfRenderer' in item:
+                        shorts_items.extend(item['shelfRenderer'].get('content', {}).get('verticalListRenderer', {}).get('items', []))
+                    elif 'shortsLockupViewModel' in item or 'reelItemRenderer' in item:
+                        shorts_items.append(item)
+
+                    for s_item in shorts_items:
+                        s_vid = None
+                        s_title = None
+                        s_views = ""
+                        if 'shortsLockupViewModel' in s_item:
+                            slvm = s_item['shortsLockupViewModel']
+                            s_vid = slvm.get('onTap', {}).get('innertubeCommand', {}).get('reelWatchEndpoint', {}).get('videoId')
+                            if not s_vid:
+                                s_vid = slvm.get('entityId', '').replace('shorts-shelf-item-', '')
+                            s_title = slvm.get('overlayMetadata', {}).get('primaryText', {}).get('content') or slvm.get('accessibilityText')
+                            s_views = slvm.get('overlayMetadata', {}).get('secondaryText', {}).get('content', '')
+                        elif 'reelItemRenderer' in s_item:
+                            rir = s_item['reelItemRenderer']
+                            s_vid = rir.get('videoId')
+                            s_title = rir.get('headline', {}).get('simpleText') or ''.join(r.get('text', '') for r in rir.get('headline', {}).get('runs', []))
+                            s_views = rir.get('viewCountText', {}).get('simpleText', '')
+
+                        if s_vid and s_title and s_vid not in existing_vid_ids:
+                            videos.append({
+                                'id': s_vid,
+                                'title': s_title,
+                                'uploader': 'YouTube Shorts',
+                                'channel': 'YouTube Shorts',
+                                'channel_id': None,
+                                'duration': 'Shorts',
+                                'published': '',
+                                'views': s_views,
+                                'type': 'video',
+                                'is_short': True
+                            })
+                            existing_vid_ids.add(s_vid)
     except Exception:
         pass
 
@@ -1340,14 +1684,16 @@ def search_youtube_fast(query, limit=30):
                     uploader = parts[2].replace("\n", " ").strip() if len(parts) > 2 else "YouTube"
                     duration = parts[3].strip() if len(parts) > 3 else "--:--"
                     cid = parts[4].strip() if len(parts) > 4 else None
+                    is_short = ('#shorts' in title.lower() or (':' in duration and len(duration.split(':')) == 2 and duration.replace(':', '').isdigit() and int(duration.split(':')[0]) * 60 + int(duration.split(':')[1]) <= 60))
                     videos.append({
                         "id": vid_id,
                         "title": title,
                         "uploader": uploader,
                         "channel": uploader,
                         "channel_id": cid,
-                        "duration": duration,
-                        "type": "video"
+                        "duration": "Shorts" if is_short and duration == "--:--" else duration,
+                        "type": "video",
+                        "is_short": is_short
                     })
                     existing_vid_ids.add(vid_id)
         except Exception:
@@ -1624,13 +1970,14 @@ class ChannelRow(Gtk.ListBoxRow):
 
 
 class VideoRow(Gtk.ListBoxRow):
-    """Widget thẻ Video: Hỗ trợ thanh màu đỏ tiến trình xem, mờ thumbnail khi xem hết, và Native GTK Icons."""
+    """Widget thẻ Video: Tối ưu với logo kênh, thống kê like/dislike (không emoji), và nút mũi tên xem chi tiết."""
     def __init__(self, video, on_play_callback, on_channel_click=None, on_download_callback=None, progress_data=None):
         super().__init__()
         self.video = video
         self.on_play_callback = on_play_callback
         self.on_channel_click = on_channel_click
         self.on_download_callback = on_download_callback
+        self.dearrow_thumb_loaded = False
 
         hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
         hbox.set_margin_start(10)
@@ -1646,6 +1993,16 @@ class VideoRow(Gtk.ListBoxRow):
         self.image.set_size_request(160, 90)
         self.overlay.add(self.image)
 
+        # Huy hiệu Shorts nếu là video ngắn
+        if video.get("is_short") or video.get("duration") == "Shorts":
+            badge_short = Gtk.Label()
+            badge_short.set_markup("<span size='small' foreground='#ffffff' background='#cc0000'> <b>SHORTS</b> </span>")
+            badge_short.set_halign(Gtk.Align.START)
+            badge_short.set_valign(Gtk.Align.START)
+            badge_short.set_margin_top(4)
+            badge_short.set_margin_start(4)
+            self.overlay.add_overlay(badge_short)
+
         # Kiểm tra tiến trình đã xem
         prog_data = progress_data if progress_data is not None else load_progress().get(vid_id, {})
         is_completed = prog_data.get("completed", False)
@@ -1653,7 +2010,6 @@ class VideoRow(Gtk.ListBoxRow):
         total_sec = prog_data.get("total", 0)
 
         if is_completed:
-            # Xem xong: thumbnail hơi mờ mờ blur blur, thanh đỏ sẽ ẩn hết
             self.image.get_style_context().add_class("thumbnail-watched")
             badge_watched = Gtk.Label()
             badge_watched.set_markup("<span size='small' foreground='#ffffff' background='#1a1a1a'> <b>✓ ĐÃ XEM</b> </span>")
@@ -1663,7 +2019,6 @@ class VideoRow(Gtk.ListBoxRow):
             badge_watched.set_margin_end(4)
             self.overlay.add_overlay(badge_watched)
         elif watched_sec > 0 and total_sec > 0:
-            # Đang xem dở: Hiện thanh màu đỏ tiến trình bên dưới thumbnail
             fraction = min(1.0, max(0.0, watched_sec / total_sec))
             pbar = Gtk.ProgressBar()
             pbar.set_fraction(fraction)
@@ -1691,34 +2046,42 @@ class VideoRow(Gtk.ListBoxRow):
         vbox.set_valign(Gtk.Align.CENTER)
 
         display_title = video.get('title', 'Video')
-        title_lbl = Gtk.Label()
-        title_lbl.set_markup(f"<b>{GLib.markup_escape_text(display_title)}</b>")
-        title_lbl.set_line_wrap(True)
-        title_lbl.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        title_lbl.set_max_width_chars(60)
-        title_lbl.set_xalign(0)
-        vbox.pack_start(title_lbl, False, False, 0)
+        self.title_lbl = Gtk.Label()
+        self.title_lbl.set_markup(f"<b>{GLib.markup_escape_text(display_title)}</b>")
+        self.title_lbl.set_line_wrap(True)
+        self.title_lbl.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.title_lbl.set_max_width_chars(60)
+        self.title_lbl.set_xalign(0)
+        vbox.pack_start(self.title_lbl, False, False, 0)
 
         # DeArrow Title & Thumb cập nhật bất đồng bộ nền (không block UI)
         settings = load_settings()
         if settings.get("dearrow", True) and vid_id:
             def _on_dearrow_title(new_title):
-                title_lbl.set_markup(f"<b>{GLib.markup_escape_text(new_title)}</b>")
+                if new_title:
+                    self.title_lbl.set_markup(f"<b>{GLib.markup_escape_text(new_title)}</b>")
             def _on_dearrow_thumb(pb):
                 if self.image and pb:
+                    self.dearrow_thumb_loaded = True
                     self.image.set_from_pixbuf(pb)
             request_dearrow_async(vid_id, on_title_cb=_on_dearrow_title, on_thumb_cb=_on_dearrow_thumb)
 
-        # Hàng thông tin chi tiết (không dùng Unicode emoji để tránh lỗi Tofu)
-        info_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        # Hàng thông tin chi tiết (Logo Kênh + Tên Kênh + Lượt xem & Ngày đăng + Stats)
+        info_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         channel_name = video.get('channel') or video.get('uploader') or 'YouTube'
+
+        chan_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        chan_avatar_img = Gtk.Image.new_from_icon_name("avatar-default-symbolic", Gtk.IconSize.MENU)
+        chan_avatar_img.set_size_request(20, 20)
+        chan_box.pack_start(chan_avatar_img, False, False, 0)
+
+        c_avatar = video.get("channel_avatar")
+        if c_avatar:
+            request_image_async(c_avatar, lambda pb, img=chan_avatar_img: img.set_from_pixbuf(pb) if pb and img else None, 20, 20, is_avatar=True)
 
         if on_channel_click:
             chan_btn = Gtk.Button()
             chan_btn.set_relief(Gtk.ReliefStyle.NONE)
-            chan_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-            chan_icon = Gtk.Image.new_from_icon_name("avatar-default-symbolic", Gtk.IconSize.MENU)
-            chan_box.pack_start(chan_icon, False, False, 0)
             chan_lbl = Gtk.Label()
             chan_lbl.set_markup(f"<span foreground='#5e9cf6'><u>{GLib.markup_escape_text(channel_name)}</u></span>")
             chan_box.pack_start(chan_lbl, False, False, 0)
@@ -1730,9 +2093,10 @@ class VideoRow(Gtk.ListBoxRow):
         else:
             chan_lbl = Gtk.Label(label=channel_name)
             chan_lbl.set_xalign(0)
-            info_box.pack_start(chan_lbl, False, False, 0)
+            chan_box.pack_start(chan_lbl, False, False, 0)
+            info_box.pack_start(chan_box, False, False, 0)
 
-        # Metadata parts
+        # Metadata parts (Lượt xem & Ngày đăng)
         meta_items = []
         if video.get("views"):
             meta_items.append(video['views'])
@@ -1747,24 +2111,55 @@ class VideoRow(Gtk.ListBoxRow):
             m_lbl.set_xalign(0)
             info_box.pack_start(m_lbl, False, False, 0)
 
+        # Thống kê Like & Dislike nạp bất đồng bộ (KHÔNG DÙNG EMOJI - Chống vỡ font Tofu)
+        self.stats_lbl = Gtk.Label()
+        self.stats_lbl.set_xalign(0)
+        info_box.pack_start(self.stats_lbl, False, False, 0)
+
+        if vid_id:
+            def _load_stats():
+                st = fetch_video_stats(vid_id)
+                if st and (st.get("likes") or st.get("dislikes")):
+                    l_s = format_compact_number(st.get("likes", 0))
+                    d_s = format_compact_number(st.get("dislikes", 0))
+                    def _apply_st():
+                        self.stats_lbl.set_markup(f"<span foreground='#5e9cf6' size='small'>• Thích: {l_s}</span>  <span foreground='#e06c75' size='small'>• Không thích: {d_s}</span>")
+                    GLib.idle_add(_apply_st)
+            stats_executor.submit(_load_stats)
+
         vbox.pack_start(info_box, False, False, 0)
         hbox.pack_start(vbox, True, True, 0)
 
-        # 3. Nút Thao tác (Phát & Tải về)
-        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        btn_box.set_valign(Gtk.Align.CENTER)
+        # 3. Nút mũi tên xem chi tiết & phát video (Giao diện tinh gọn chỉ 1 nút mũi tên)
+        arrow_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        arrow_box.set_valign(Gtk.Align.CENTER)
+        self.arrow_btn = create_icon_button("go-next-symbolic", None, tooltip="Xem chi tiết, bình luận & phát video")
+        self.arrow_btn.connect("clicked", lambda b: self.open_detail_dialog())
+        arrow_box.pack_start(self.arrow_btn, False, False, 0)
+        hbox.pack_end(arrow_box, False, False, 0)
 
-        if self.on_download_callback:
-            dl_btn = create_icon_button("folder-download-symbolic", None, tooltip="Tải video hoặc audio về máy")
-            dl_btn.connect("clicked", lambda b: self.on_download_callback(self.video))
-            btn_box.pack_start(dl_btn, False, False, 0)
-
-        play_btn = create_icon_button("media-playback-start-symbolic", "Phát", css_class="suggested-action")
-        play_btn.connect("clicked", lambda b: self.on_play_callback(self.video))
-        btn_box.pack_start(play_btn, False, False, 0)
-
-        hbox.pack_end(btn_box, False, False, 0)
         self.add(hbox)
+
+    def open_detail_dialog(self):
+        parent = self.get_toplevel()
+        if not isinstance(parent, Gtk.Window):
+            parent = None
+        dlg = VideoDetailDialog(
+            parent, self.video,
+            on_play_callback=self.on_play_callback,
+            on_download_callback=self.on_download_callback,
+            on_channel_click=self.on_channel_click
+        )
+        dlg.run()
+        dlg.destroy()
+
+    def _copy_video_link(self, btn=None):
+        vid_id = self.video.get("id")
+        url = f"https://youtu.be/{vid_id}" if vid_id else self.video.get("url", "")
+        Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(url, -1)
+
+    def _open_comments_dialog(self, btn=None):
+        self.open_detail_dialog()
 
     def _handle_channel_click(self, channel_name, channel_id):
         if not self.on_channel_click:
@@ -1779,8 +2174,257 @@ class VideoRow(Gtk.ListBoxRow):
             threading.Thread(target=_res, daemon=True).start()
 
     def _update_image(self, pixbuf):
-        if self.image and pixbuf:
+        if self.image and pixbuf and not self.dearrow_thumb_loaded:
             self.image.set_from_pixbuf(pixbuf)
+
+
+class VideoDetailDialog(Gtk.Dialog):
+    """Cửa sổ hiển thị đầy đủ chi tiết video: logo kênh, tên kênh, mô tả, bình luận, like/dislike, sao chép link và phát video."""
+    def __init__(self, parent, video, on_play_callback=None, on_download_callback=None, on_channel_click=None):
+        super().__init__(
+            title="Chi tiết Video",
+            transient_for=parent,
+            modal=True
+        )
+        self.set_default_size(840, 640)
+        self.video = video
+        self.vid_id = video.get("id")
+        self.on_play_callback = on_play_callback
+        self.on_download_callback = on_download_callback
+        self.on_channel_click = on_channel_click
+
+        self.add_button("Đóng", Gtk.ResponseType.CLOSE)
+
+        content = self.get_content_area()
+        content.set_spacing(10)
+        content.set_margin_start(16)
+        content.set_margin_end(16)
+        content.set_margin_top(12)
+        content.set_margin_bottom(10)
+
+        # 1. Tiêu đề video
+        title = video.get("title", "Video")
+        title_lbl = Gtk.Label()
+        title_lbl.set_markup(f"<b><big>{GLib.markup_escape_text(title)}</big></b>")
+        title_lbl.set_line_wrap(True)
+        title_lbl.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        title_lbl.set_xalign(0)
+        title_lbl.set_selectable(True)
+        content.pack_start(title_lbl, False, False, 0)
+
+        # 2. Hàng Thông tin Kênh (Logo Kênh + Tên Kênh + Thời lượng/Ngày đăng)
+        channel_name = video.get("channel") or video.get("uploader") or "YouTube"
+        chan_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        chan_row.get_style_context().add_class("channel-card")
+
+        self.chan_avatar_img = Gtk.Image.new_from_icon_name("avatar-default-symbolic", Gtk.IconSize.DND)
+        self.chan_avatar_img.set_size_request(44, 44)
+        chan_row.pack_start(self.chan_avatar_img, False, False, 0)
+
+        c_avatar = video.get("channel_avatar")
+        if c_avatar:
+            request_image_async(c_avatar, lambda pb, img=self.chan_avatar_img: img.set_from_pixbuf(pb) if pb and img else None, 44, 44, is_avatar=True)
+
+        chan_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        chan_info.set_valign(Gtk.Align.CENTER)
+
+        c_lbl = Gtk.Label()
+        c_lbl.set_markup(f"<b>{GLib.markup_escape_text(channel_name)}</b> <span foreground='#3ea6ff'>✔</span>")
+        c_lbl.set_xalign(0)
+        chan_info.pack_start(c_lbl, False, False, 0)
+
+        dur = video.get("duration", "--:--")
+        pub = video.get("published", "")
+        meta_txt = f"{dur}" + (f" • {pub}" if pub else "")
+        meta_sub_lbl = Gtk.Label()
+        meta_sub_lbl.set_markup(f"<span foreground='#aaaaaa' size='small'>{GLib.markup_escape_text(meta_txt)}</span>")
+        meta_sub_lbl.set_xalign(0)
+        chan_info.pack_start(meta_sub_lbl, False, False, 0)
+
+        chan_row.pack_start(chan_info, True, True, 0)
+
+        if on_channel_click:
+            btn_view_chan = create_icon_button("video-display-symbolic", "Xem kênh")
+            btn_view_chan.set_valign(Gtk.Align.CENTER)
+            btn_view_chan.connect("clicked", lambda b: (self.response(Gtk.ResponseType.CLOSE), on_channel_click(video.get("channel_id"), channel_name)))
+            chan_row.pack_end(btn_view_chan, False, False, 0)
+
+        content.pack_start(chan_row, False, False, 0)
+
+        # 3. Hàng Thống kê Like / Dislike / Lượt xem / Đánh giá (Tuyệt đối không emoji)
+        self.stats_lbl = Gtk.Label()
+        self.stats_lbl.set_markup("<span foreground='#aaaaaa'>Đang tải thống kê Like / Dislike...</span>")
+        self.stats_lbl.set_xalign(0)
+        content.pack_start(self.stats_lbl, False, False, 0)
+
+        # 4. Hàng nút thao tác: Phát, Sao chép link, Tải về
+        act_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+
+        if self.on_play_callback:
+            btn_play = create_icon_button("media-playback-start-symbolic", "Phát video", css_class="suggested-action")
+            btn_play.connect("clicked", lambda b: (self.response(Gtk.ResponseType.CLOSE), self.on_play_callback(self.video)))
+            act_box.pack_start(btn_play, False, False, 0)
+
+        self.btn_copy = create_icon_button("edit-copy-symbolic", "Sao chép link video")
+        self.btn_copy.connect("clicked", self._copy_link)
+        act_box.pack_start(self.btn_copy, False, False, 0)
+
+        if self.on_download_callback:
+            btn_dl = create_icon_button("folder-download-symbolic", "Tải về")
+            btn_dl.connect("clicked", lambda b: (self.response(Gtk.ResponseType.CLOSE), self.on_download_callback(self.video)))
+            act_box.pack_start(btn_dl, False, False, 0)
+
+        content.pack_start(act_box, False, False, 0)
+
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        content.pack_start(sep, False, False, 4)
+
+        # 5. Notebook 2 Tab: "Mô tả video" và "Bình luận"
+        self.notebook = Gtk.Notebook()
+
+        # Tab Mô tả
+        desc_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        desc_box.set_margin_top(8)
+        desc_box.set_margin_bottom(8)
+        desc_scroll = Gtk.ScrolledWindow()
+        desc_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.desc_lbl = Gtk.Label()
+        self.desc_lbl.set_line_wrap(True)
+        self.desc_lbl.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.desc_lbl.set_xalign(0)
+        self.desc_lbl.set_yalign(0)
+        self.desc_lbl.set_selectable(True)
+        self.desc_lbl.set_margin_start(6)
+        self.desc_lbl.set_margin_end(6)
+        self.desc_lbl.set_text("Đang tải mô tả chi tiết...")
+        desc_scroll.add(self.desc_lbl)
+        desc_box.pack_start(desc_scroll, True, True, 0)
+        self.notebook.append_page(desc_box, create_tab_label("text-x-generic-symbolic", "Mô tả video"))
+
+        # Tab Bình luận
+        comm_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        comm_box.set_margin_top(8)
+        comm_box.set_margin_bottom(8)
+        self.comm_spinner = Gtk.Spinner()
+        comm_box.pack_start(self.comm_spinner, False, False, 0)
+
+        comm_scroll = Gtk.ScrolledWindow()
+        comm_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.comments_list = Gtk.ListBox()
+        self.comments_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        comm_scroll.add(self.comments_list)
+        comm_box.pack_start(comm_scroll, True, True, 0)
+
+        self.comm_status_lbl = Gtk.Label(label="Đang nạp bình luận từ YouTube...")
+        self.comm_status_lbl.set_xalign(0)
+        comm_box.pack_start(self.comm_status_lbl, False, False, 0)
+
+        self.notebook.append_page(comm_box, create_tab_label("dialog-information-symbolic", "Bình luận"))
+        content.pack_start(self.notebook, True, True, 0)
+
+        # Dòng trạng thái (sao chép link v.v.)
+        self.status_lbl = Gtk.Label()
+        self.status_lbl.set_xalign(0)
+        content.pack_start(self.status_lbl, False, False, 0)
+
+        content.show_all()
+        self._load_data()
+
+    def _copy_link(self, btn):
+        url = f"https://youtu.be/{self.vid_id}" if self.vid_id else self.video.get("url", "")
+        Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(url, -1)
+        self.btn_copy.set_tooltip_text("Đã sao chép liên kết!")
+        self.status_lbl.set_text(f"Đã sao chép liên kết: {url}")
+
+    def _load_data(self):
+        self.comm_spinner.start()
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self):
+        # 1. Thống kê Like/Dislike (Return YouTube Dislike API - Không dùng emoji)
+        stats = fetch_video_stats(self.vid_id)
+        if stats:
+            l_str = format_compact_number(stats.get("likes", 0))
+            d_str = format_compact_number(stats.get("dislikes", 0))
+            views_str = format_compact_number(stats.get("view_count", 0))
+            r = stats.get("rating", 0.0)
+            markup = (
+                f"<span foreground='#5e9cf6'><b>Thích: {l_str}</b></span>  •  "
+                f"<span foreground='#e06c75'><b>Không thích: {d_str}</b></span>  •  "
+                f"<span>Lượt xem: {views_str}</span>  •  "
+                f"<span foreground='#e5c07b'>Đánh giá: {r:.1f} / 5.0</span>"
+            )
+            GLib.idle_add(self.stats_lbl.set_markup, markup)
+        else:
+            GLib.idle_add(self.stats_lbl.set_markup, "<span foreground='#888888'>Không có dữ liệu like/dislike</span>")
+
+        # 2. Chi tiết mô tả video
+        details = fetch_video_details_fast(self.vid_id)
+        desc = details.get("description", "").strip() or self.video.get("description", "").strip() or "Không có phần mô tả cho video này."
+        GLib.idle_add(self.desc_lbl.set_text, desc)
+
+        # 3. Bình luận
+        comments = fetch_video_comments_fast(self.vid_id, max_count=35)
+        GLib.idle_add(self._render_comments, comments)
+
+    def _render_comments(self, comments):
+        self.comm_spinner.stop()
+        self.comm_spinner.hide()
+        for child in self.comments_list.get_children():
+            self.comments_list.remove(child)
+
+        if not comments:
+            self.comm_status_lbl.set_text("Video không có bình luận hoặc tính năng bình luận đã bị tắt.")
+            return
+
+        self.comm_status_lbl.set_text(f"Đã hiển thị {len(comments)} bình luận hàng đầu")
+
+        for c in comments:
+            row = Gtk.ListBoxRow()
+            c_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            c_box.set_margin_start(8)
+            c_box.set_margin_end(8)
+            c_box.set_margin_top(8)
+            c_box.set_margin_bottom(8)
+
+            # Avatar người bình luận
+            avatar_img = Gtk.Image.new_from_icon_name("avatar-default-symbolic", Gtk.IconSize.DND)
+            avatar_img.set_size_request(36, 36)
+            c_box.pack_start(avatar_img, False, False, 0)
+            if c.get("avatar"):
+                request_image_async(c["avatar"], lambda pb, img=avatar_img: img.set_from_pixbuf(pb) if pb and img else None, 36, 36, is_avatar=True)
+
+            text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            meta_lbl = Gtk.Label()
+            author = GLib.markup_escape_text(c.get("author", "Người dùng"))
+            time_txt = GLib.markup_escape_text(c.get("time", ""))
+            meta_lbl.set_markup(f"<b>{author}</b> <span foreground='#888888' size='small'>{time_txt}</span>")
+            meta_lbl.set_xalign(0)
+            text_box.pack_start(meta_lbl, False, False, 0)
+
+            body_lbl = Gtk.Label()
+            body_lbl.set_text(c.get("text", ""))
+            body_lbl.set_line_wrap(True)
+            body_lbl.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            body_lbl.set_xalign(0)
+            body_lbl.set_selectable(True)
+            text_box.pack_start(body_lbl, False, False, 0)
+
+            likes = c.get("likes")
+            if likes and likes != "0":
+                like_lbl = Gtk.Label()
+                like_lbl.set_markup(f"<span foreground='#aaaaaa' size='small'>• Thích: {GLib.markup_escape_text(str(likes))}</span>")
+                like_lbl.set_xalign(0)
+                text_box.pack_start(like_lbl, False, False, 0)
+
+            c_box.pack_start(text_box, True, True, 0)
+            row.add(c_box)
+            self.comments_list.add(row)
+
+        self.comments_list.show_all()
+
+
+CommentsDialog = VideoDetailDialog
 
 
 # ==============================================================================
@@ -1788,22 +2432,23 @@ class VideoRow(Gtk.ListBoxRow):
 # ==============================================================================
 
 class ChannelVideosDialog(Gtk.Dialog):
+    """Cửa sổ Kênh YouTube đa tab: Trang chủ (giới thiệu & trailer), Video (video tải lên), Shorts (video ngắn)."""
     def __init__(self, parent, channel_id, channel_name, settings, play_callback, on_subs_changed=None, download_callback=None):
         super().__init__(
             title=f"Kênh: {channel_name}",
             transient_for=parent,
             modal=True
         )
-        self.set_default_size(960, 680)
+        self.set_default_size(980, 700)
         self.channel_id = channel_id
         self.channel_name = channel_name
         self.settings = settings
         self.play_callback = play_callback
         self.on_subs_changed = on_subs_changed
         self.download_callback = download_callback
-        self.all_videos = []
         self.channel_meta = {}
-        self.is_loading = False
+        self.tab_cache = {"featured": None, "videos": None, "shorts": None}
+        self.tab_loading = {"featured": False, "videos": False, "shorts": False}
 
         self.add_button("Đóng", Gtk.ResponseType.CLOSE)
 
@@ -1851,136 +2496,382 @@ class ChannelVideosDialog(Gtk.Dialog):
 
         content.pack_start(header_box, False, False, 0)
 
-        # 2. Thanh điều khiển Toolbar
-        toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        toolbar.set_margin_start(12)
-        toolbar.set_margin_end(12)
-        toolbar.set_margin_top(6)
-        toolbar.set_margin_bottom(6)
+        # 2. Gtk.Notebook 3 Tab: "Trang chủ", "Video", "Shorts"
+        self.notebook = Gtk.Notebook()
+        self.notebook.set_margin_start(8)
+        self.notebook.set_margin_end(8)
+        self.notebook.set_margin_top(4)
 
-        self.filter_entry = Gtk.SearchEntry()
-        self.filter_entry.set_placeholder_text("Lọc video trong kênh theo tiêu đề...")
-        self.filter_entry.connect("search-changed", lambda e: self._redraw())
-        toolbar.pack_start(self.filter_entry, True, True, 0)
+        # TAB 1: TRANG CHỦ
+        self.home_vbox = self._create_home_tab()
+        self.notebook.append_page(self.home_vbox, create_tab_label("user-home-symbolic", "Trang chủ"))
 
-        btn_refresh = create_icon_button("view-refresh-symbolic", "Tải lại", tooltip="Tải lại danh sách video từ kênh")
-        btn_refresh.connect("clicked", lambda b: self._reload())
-        toolbar.pack_start(btn_refresh, False, False, 0)
+        # TAB 2: VIDEO
+        self.videos_vbox = self._create_videos_tab()
+        self.notebook.append_page(self.videos_vbox, create_tab_label("video-x-generic-symbolic", "Video"))
 
-        self.chan_spinner = Gtk.Spinner()
-        toolbar.pack_start(self.chan_spinner, False, False, 0)
+        # TAB 3: SHORTS
+        self.shorts_vbox = self._create_shorts_tab()
+        self.notebook.append_page(self.shorts_vbox, create_tab_label("media-playlist-repeat-symbolic", "Shorts"))
 
-        sort_lbl = Gtk.Label(label="Sắp xếp:")
-        toolbar.pack_end(sort_lbl, False, False, 0)
-        self.sort_combo = Gtk.ComboBoxText()
-        for label in SORT_MODES:
-            self.sort_combo.append_text(label)
-        self.sort_combo.set_active(0)
-        self.sort_combo.connect("changed", lambda c: self._redraw())
-        toolbar.pack_end(self.sort_combo, False, False, 0)
+        self.notebook.connect("switch-page", self._on_tab_switched)
+        content.pack_start(self.notebook, True, True, 0)
 
-        content.pack_start(toolbar, False, False, 0)
-
-        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-        content.pack_start(sep, False, False, 0)
-
-        # 3. Danh sách video & Infinite scroll
-        self.scroll = Gtk.ScrolledWindow()
-        self.scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self.video_list = Gtk.ListBox()
-        self.video_list.set_selection_mode(Gtk.SelectionMode.NONE)
-        self.scroll.add(self.video_list)
-        content.pack_start(self.scroll, True, True, 0)
-
-        # Tự động cuộn nạp thêm video khi tới đáy trang
-        vadjust = self.scroll.get_vadjustment()
-        vadjust.connect("value-changed", self._on_scroll_changed)
-
-        # 4. Trạng thái
-        self.status_lbl = Gtk.Label(label="Đang tải danh sách video...")
+        # 3. Thanh trạng thái
+        self.status_lbl = Gtk.Label(label="Đang kết nối tới kênh YouTube...")
         self.status_lbl.set_xalign(0)
-        self.status_lbl.set_margin_start(12)
+        self.status_lbl.set_margin_start(14)
         self.status_lbl.set_margin_bottom(6)
         content.pack_start(self.status_lbl, False, False, 0)
 
         content.show_all()
-        self._reload()
 
-    def _on_scroll_changed(self, adj):
+        # Nạp dữ liệu ban đầu cho Trang chủ
+        self._load_tab("featured")
+
+    def _create_home_tab(self):
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        vbox.set_margin_start(10)
+        vbox.set_margin_end(10)
+        vbox.set_margin_top(10)
+        vbox.set_margin_bottom(10)
+
+        # Khung Giới thiệu kênh / Thể loại ("Loại của chủ kênh")
+        about_frame = Gtk.Frame()
+        about_frame.set_label(" Giới thiệu kênh & Thể loại ")
+        about_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        about_box.set_margin_start(12)
+        about_box.set_margin_end(12)
+        about_box.set_margin_top(8)
+        about_box.set_margin_bottom(8)
+        self.home_desc_lbl = Gtk.Label()
+        self.home_desc_lbl.set_text("Đang tải giới thiệu kênh...")
+        self.home_desc_lbl.set_line_wrap(True)
+        self.home_desc_lbl.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.home_desc_lbl.set_xalign(0)
+        self.home_desc_lbl.set_selectable(True)
+        about_box.pack_start(self.home_desc_lbl, False, False, 0)
+        about_frame.add(about_box)
+        vbox.pack_start(about_frame, False, False, 0)
+
+        # Khung Video nổi bật / Trailer của chủ kênh
+        self.trailer_frame = Gtk.Frame()
+        self.trailer_frame.set_label(" Video nổi bật / Trailer của chủ kênh ")
+        self.trailer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.trailer_box.set_margin_start(12)
+        self.trailer_box.set_margin_end(12)
+        self.trailer_box.set_margin_top(8)
+        self.trailer_box.set_margin_bottom(8)
+        self.trailer_status_lbl = Gtk.Label(label="Đang tải video giới thiệu của chủ kênh...")
+        self.trailer_status_lbl.set_xalign(0)
+        self.trailer_box.pack_start(self.trailer_status_lbl, False, False, 0)
+        self.trailer_frame.add(self.trailer_box)
+        vbox.pack_start(self.trailer_frame, False, False, 0)
+
+        # Khung Video đề xuất trên trang chủ
+        shelves_frame = Gtk.Frame()
+        shelves_frame.set_label(" Video đề xuất trên Trang chủ ")
+        self.home_shelves_list = Gtk.ListBox()
+        self.home_shelves_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        shelves_frame.add(self.home_shelves_list)
+        vbox.pack_start(shelves_frame, True, True, 0)
+
+        scroll.add(vbox)
+        return scroll
+
+    def _create_videos_tab(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        toolbar.set_margin_start(10)
+        toolbar.set_margin_end(10)
+        toolbar.set_margin_top(8)
+
+        self.videos_filter_entry = Gtk.SearchEntry()
+        self.videos_filter_entry.set_placeholder_text("Lọc video tải lên...")
+        self.videos_filter_entry.connect("search-changed", lambda e: self._redraw_videos())
+        toolbar.pack_start(self.videos_filter_entry, True, True, 0)
+
+        btn_refresh = create_icon_button("view-refresh-symbolic", "Tải lại")
+        btn_refresh.connect("clicked", lambda b: self._reload_tab("videos"))
+        toolbar.pack_start(btn_refresh, False, False, 0)
+
+        self.videos_spinner = Gtk.Spinner()
+        toolbar.pack_start(self.videos_spinner, False, False, 0)
+
+        sort_lbl = Gtk.Label(label="Sắp xếp:")
+        toolbar.pack_end(sort_lbl, False, False, 0)
+        self.videos_sort_combo = Gtk.ComboBoxText()
+        for label in SORT_MODES:
+            self.videos_sort_combo.append_text(label)
+        self.videos_sort_combo.set_active(0)
+        self.videos_sort_combo.connect("changed", lambda c: self._redraw_videos())
+        toolbar.pack_end(self.videos_sort_combo, False, False, 0)
+
+        vbox.pack_start(toolbar, False, False, 0)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.videos_list = Gtk.ListBox()
+        self.videos_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        scroll.add(self.videos_list)
+        vbox.pack_start(scroll, True, True, 0)
+
+        vadjust = scroll.get_vadjustment()
+        vadjust.connect("value-changed", self._on_videos_scroll_changed)
+        return vbox
+
+    def _create_shorts_tab(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        toolbar.set_margin_start(10)
+        toolbar.set_margin_end(10)
+        toolbar.set_margin_top(8)
+
+        self.shorts_filter_entry = Gtk.SearchEntry()
+        self.shorts_filter_entry.set_placeholder_text("Lọc video Shorts...")
+        self.shorts_filter_entry.connect("search-changed", lambda e: self._redraw_shorts())
+        toolbar.pack_start(self.shorts_filter_entry, True, True, 0)
+
+        btn_refresh = create_icon_button("view-refresh-symbolic", "Tải lại")
+        btn_refresh.connect("clicked", lambda b: self._reload_tab("shorts"))
+        toolbar.pack_start(btn_refresh, False, False, 0)
+
+        self.shorts_spinner = Gtk.Spinner()
+        toolbar.pack_start(self.shorts_spinner, False, False, 0)
+
+        vbox.pack_start(toolbar, False, False, 0)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.shorts_list = Gtk.ListBox()
+        self.shorts_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        scroll.add(self.shorts_list)
+        vbox.pack_start(scroll, True, True, 0)
+        return vbox
+
+    def _on_tab_switched(self, notebook, page, page_num):
+        tab_names = ["featured", "videos", "shorts"]
+        if 0 <= page_num < len(tab_names):
+            t_name = tab_names[page_num]
+            if not self.tab_cache.get(t_name):
+                self._load_tab(t_name)
+
+    def _load_tab(self, tab_type):
+        if self.tab_loading.get(tab_type):
+            return
+        self.tab_loading[tab_type] = True
+        self.status_lbl.set_text(f"Đang tải nội dung mục {tab_type} từ YouTube...")
+
+        if tab_type == "videos" and hasattr(self, "videos_spinner"):
+            self.videos_spinner.start()
+        elif tab_type == "shorts" and hasattr(self, "shorts_spinner"):
+            self.shorts_spinner.start()
+
+        def _worker():
+            res = fetch_channel_tab_data(self.channel_id, tab_type=tab_type)
+            GLib.idle_add(self._on_tab_loaded, tab_type, res)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _reload_tab(self, tab_type):
+        self.tab_cache[tab_type] = None
+        self._load_tab(tab_type)
+
+    def _on_tab_loaded(self, tab_type, data):
+        self.tab_loading[tab_type] = False
+        if tab_type == "videos" and hasattr(self, "videos_spinner"):
+            self.videos_spinner.stop()
+        elif tab_type == "shorts" and hasattr(self, "shorts_spinner"):
+            self.shorts_spinner.stop()
+
+        if not data:
+            self.status_lbl.set_text(f"Không thể tải nội dung tab {tab_type}.")
+            return
+
+        self.tab_cache[tab_type] = data
+        ch_meta = data.get("channel", {})
+        if ch_meta:
+            self._apply_channel_meta(ch_meta)
+
+        if tab_type == "featured":
+            self._render_featured_tab(data)
+        elif tab_type == "videos":
+            self._redraw_videos()
+        elif tab_type == "shorts":
+            self._redraw_shorts()
+
+        self.status_lbl.set_text(f"Đã cập nhật dữ liệu kênh: {self.channel_name}")
+
+    def _render_featured_tab(self, data):
+        meta = data.get("channel", {})
+        desc = meta.get("description", "").strip() or "Kênh chưa có phần mô tả."
+        self.home_desc_lbl.set_text(desc)
+
+        for c in self.trailer_box.get_children():
+            self.trailer_box.remove(c)
+
+        f_vid = data.get("featured_video")
+        if f_vid:
+            t_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+            t_img = Gtk.Image.new_from_pixbuf(get_placeholder_pixbuf(160, 90))
+            t_img.set_size_request(160, 90)
+            request_thumbnail_async(f_vid["id"], lambda pb, img=t_img: img.set_from_pixbuf(pb) if pb and img else None, 160, 90)
+            t_row.pack_start(t_img, False, False, 0)
+
+            t_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+            t_title = Gtk.Label()
+            t_title.set_markup(f"<b>{GLib.markup_escape_text(f_vid.get('title', ''))}</b>")
+            t_title.set_line_wrap(True)
+            t_title.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            t_title.set_xalign(0)
+            t_info.pack_start(t_title, False, False, 0)
+
+            t_meta = Gtk.Label()
+            meta_str = " • ".join(filter(None, [f_vid.get("views"), f_vid.get("published")]))
+            t_meta.set_markup(f"<span foreground='#aaaaaa' size='small'>{GLib.markup_escape_text(meta_str)}</span>")
+            t_meta.set_xalign(0)
+            t_info.pack_start(t_meta, False, False, 0)
+
+            t_desc = Gtk.Label()
+            short_d = f_vid.get("description", "")[:180] + ("..." if len(f_vid.get("description", "")) > 180 else "")
+            t_desc.set_markup(f"<span foreground='#888888'>{GLib.markup_escape_text(short_d)}</span>")
+            t_desc.set_line_wrap(True)
+            t_desc.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            t_desc.set_xalign(0)
+            t_info.pack_start(t_desc, False, False, 0)
+
+            t_row.pack_start(t_info, True, True, 0)
+
+            btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            btn_box.set_valign(Gtk.Align.CENTER)
+            play_btn = create_icon_button("media-playback-start-symbolic", "Phát ngay", css_class="suggested-action")
+            play_btn.connect("clicked", lambda b: self.play_callback(f_vid))
+            btn_box.pack_start(play_btn, False, False, 0)
+
+            arrow_btn = create_icon_button("go-next-symbolic", None, tooltip="Xem chi tiết & bình luận")
+            arrow_btn.connect("clicked", lambda b: VideoDetailDialog(self.get_toplevel(), f_vid, on_play_callback=self.play_callback, on_download_callback=self.download_callback).run())
+            btn_box.pack_start(arrow_btn, False, False, 0)
+
+            t_row.pack_end(btn_box, False, False, 0)
+            self.trailer_box.pack_start(t_row, False, False, 0)
+        else:
+            lbl = Gtk.Label(label="Kênh không cài đặt video giới thiệu nổi bật.")
+            lbl.set_xalign(0)
+            self.trailer_box.pack_start(lbl, False, False, 0)
+        self.trailer_box.show_all()
+
+        # Danh sách video trên trang chủ
+        for c in self.home_shelves_list.get_children():
+            self.home_shelves_list.remove(c)
+        home_videos = data.get("videos", [])
+        if home_videos:
+            prog_map = load_progress()
+            for v in home_videos[:25]:
+                p_data = prog_map.get(v.get("id"), {})
+                row = VideoRow(v, self.play_callback, on_download_callback=self.download_callback, progress_data=p_data)
+                self.home_shelves_list.add(row)
+        else:
+            lbl = Gtk.Label(label="Chưa có video đề xuất trên trang chủ.")
+            lbl.set_margin_top(14)
+            lbl.set_margin_bottom(14)
+            self.home_shelves_list.add(lbl)
+        self.home_shelves_list.show_all()
+
+    def _redraw_videos(self):
+        for c in self.videos_list.get_children():
+            self.videos_list.remove(c)
+        data = self.tab_cache.get("videos")
+        if not data or not data.get("videos"):
+            lbl = Gtk.Label(label="Chưa có video tải lên hoặc đang tải...")
+            lbl.set_margin_top(20)
+            self.videos_list.add(lbl)
+            self.videos_list.show_all()
+            return
+
+        kw = self.videos_filter_entry.get_text().strip().lower()
+        all_vids = data.get("videos", [])
+        if kw:
+            videos = [v for v in all_vids if kw in v.get("title", "").lower()]
+        else:
+            videos = list(all_vids)
+
+        mode_label = self.videos_sort_combo.get_active_text() or "Mới nhất"
+        mode = SORT_MODES.get(mode_label, "newest")
+        sorted_v = sort_videos(videos, mode)
+
+        if not sorted_v:
+            lbl = Gtk.Label(label="Không có video nào khớp với bộ lọc." if kw else "Chưa có video nào.")
+            lbl.set_margin_top(20)
+            self.videos_list.add(lbl)
+        else:
+            prog_map = load_progress()
+            for v in sorted_v:
+                p_data = prog_map.get(v.get("id"), {})
+                row = VideoRow(v, self.play_callback, on_download_callback=self.download_callback, progress_data=p_data)
+                self.videos_list.add(row)
+        self.videos_list.show_all()
+
+    def _redraw_shorts(self):
+        for c in self.shorts_list.get_children():
+            self.shorts_list.remove(c)
+        data = self.tab_cache.get("shorts")
+        if not data or not data.get("videos"):
+            lbl = Gtk.Label(label="Chưa có video Shorts hoặc đang tải...")
+            lbl.set_margin_top(20)
+            self.shorts_list.add(lbl)
+            self.shorts_list.show_all()
+            return
+
+        kw = self.shorts_filter_entry.get_text().strip().lower()
+        all_shorts = data.get("videos", [])
+        if kw:
+            shorts_vids = [s for s in all_shorts if kw in s.get("title", "").lower()]
+        else:
+            shorts_vids = list(all_shorts)
+
+        if not shorts_vids:
+            lbl = Gtk.Label(label="Không có video Shorts nào khớp với bộ lọc." if kw else "Chưa có video Shorts nào.")
+            lbl.set_margin_top(20)
+            self.shorts_list.add(lbl)
+        else:
+            prog_map = load_progress()
+            for s in shorts_vids:
+                p_data = prog_map.get(s.get("id"), {})
+                row = VideoRow(s, self.play_callback, on_download_callback=self.download_callback, progress_data=p_data)
+                self.shorts_list.add(row)
+        self.shorts_list.show_all()
+
+    def _on_videos_scroll_changed(self, adj):
         if not self.settings.get("auto_load_more", True):
             return
         upper = adj.get_upper()
         page = adj.get_page_size()
         val = adj.get_value()
         if upper > page and val + page >= upper - 140:
-            if not self.is_loading and len(self.all_videos) < 60:
+            data = self.tab_cache.get("videos")
+            if data and len(data.get("videos", [])) < 80 and not self.tab_loading.get("videos"):
                 self._load_more_ytdlp()
 
-    def _reload(self):
-        self.is_loading = True
-        self.chan_spinner.start()
-        self.status_lbl.set_text("Đang kết nối và tải video từ kênh...")
-        threading.Thread(target=self._load_videos_worker, daemon=True).start()
-
-    def _load_videos_worker(self):
-        try:
-            # 1. Thử tải nhanh từ Web YouTube (đầy đủ metadata & 30 video)
-            web_res = fetch_channel_videos_web(self.channel_id)
-            if web_res and web_res.get("videos"):
-                GLib.idle_add(self._apply_channel_meta, web_res.get("channel", {}))
-                GLib.idle_add(self._render_videos, web_res["videos"], f"Web ({len(web_res['videos'])} video)")
-                self.is_loading = False
-                return
-        except Exception:
-            pass
-
-        try:
-            # 2. Thử nhanh từ RSS XML (<0.5s)
-            channel_info = {"id": self.channel_id, "name": self.channel_name}
-            rss_videos = fetch_feed_for_channel(channel_info)
-            if rss_videos:
-                GLib.idle_add(self._render_videos, rss_videos, f"RSS ({len(rss_videos)} video mới nhất)")
-                self.is_loading = False
-                return
-        except Exception:
-            pass
-
-        try:
-            # 3. Fallback bằng yt-dlp
-            ytdlp_videos = fetch_channel_videos_ytdlp(self.channel_id, limit=50)
-            if ytdlp_videos:
-                GLib.idle_add(self._render_videos, ytdlp_videos, f"yt-dlp ({len(ytdlp_videos)} video)")
-                self.is_loading = False
-                return
-        except Exception:
-            pass
-
-        self.is_loading = False
-        GLib.idle_add(self._render_videos, [], "Không tìm thấy video")
-
     def _load_more_ytdlp(self):
-        self.is_loading = True
-        self.chan_spinner.start()
-        self.status_lbl.set_text("Đang tự động tải thêm video...")
-
+        self.tab_loading["videos"] = True
+        self.status_lbl.set_text("Đang tải thêm video bằng yt-dlp...")
         def _worker():
-            more = fetch_channel_videos_ytdlp(self.channel_id, limit=100)
-            GLib.idle_add(self._append_videos, more)
-
+            more = fetch_channel_videos_ytdlp(self.channel_id, limit=80)
+            def _apply():
+                self.tab_loading["videos"] = False
+                data = self.tab_cache.get("videos", {"videos": []})
+                existing = {v['id'] for v in data.get("videos", [])}
+                for m in more:
+                    if m['id'] not in existing:
+                        data["videos"].append(m)
+                        existing.add(m['id'])
+                self.tab_cache["videos"] = data
+                self._redraw_videos()
+                self.status_lbl.set_text(f"Đã tải thêm {len(more)} video.")
+            GLib.idle_add(_apply)
         threading.Thread(target=_worker, daemon=True).start()
-
-    def _append_videos(self, more_vids):
-        self.is_loading = False
-        self.chan_spinner.stop()
-        existing = {v['id'] for v in self.all_videos}
-        added = 0
-        for v in more_vids:
-            if v['id'] not in existing:
-                self.all_videos.append(v)
-                existing.add(v['id'])
-                added += 1
-        self._redraw()
-        self.status_lbl.set_text(f"Đã tải thêm {added} video. Tổng cộng: {len(self.all_videos)} video.")
 
     def _apply_channel_meta(self, meta):
         if not meta:
@@ -2030,43 +2921,6 @@ class ChannelVideosDialog(Gtk.Dialog):
             self.status_lbl.set_text(f"Đã theo dõi kênh: {self.channel_name}")
         if self.on_subs_changed:
             self.on_subs_changed()
-
-    def _render_videos(self, videos, source_label):
-        self.chan_spinner.stop()
-        self.all_videos = list(videos)
-        if not videos:
-            self.status_lbl.set_text("Kênh chưa có video nào hoặc không tải được.")
-            self._redraw()
-            return
-        self.status_lbl.set_text(f"{len(videos)} video – nguồn: {source_label}")
-        self._redraw()
-
-    def _redraw(self):
-        for child in self.video_list.get_children():
-            self.video_list.remove(child)
-
-        kw = self.filter_entry.get_text().strip().lower()
-        if kw:
-            videos = [v for v in self.all_videos if kw in v.get("title", "").lower()]
-        else:
-            videos = list(self.all_videos)
-
-        mode_label = self.sort_combo.get_active_text() or "Mới nhất"
-        mode = SORT_MODES.get(mode_label, "newest")
-        sorted_v = sort_videos(videos, mode)
-
-        if not sorted_v:
-            lbl = Gtk.Label(label="Không có video nào khớp với bộ lọc." if kw else "Chưa có video nào.")
-            lbl.set_margin_top(20)
-            self.video_list.add(lbl)
-        else:
-            prog_map = load_progress()
-            for v in sorted_v:
-                p_data = prog_map.get(v.get("id"), {})
-                row = VideoRow(v, self.play_callback, on_download_callback=self.download_callback, progress_data=p_data)
-                self.video_list.add(row)
-
-        self.video_list.show_all()
 
 
 # ==============================================================================
@@ -2222,6 +3076,18 @@ class MainWindow(Gtk.Window):
             background-color: rgba(255, 255, 255, 0.3);
             min-height: 4px;
             border-radius: 0px;
+        }
+        .featured-channel-frame {
+            border: 2px solid #3ea6ff;
+            border-radius: 8px;
+            margin: 6px 4px;
+            padding: 4px;
+            background-color: rgba(62, 166, 255, 0.06);
+        }
+        .settings-frame {
+            margin-bottom: 12px;
+            border-radius: 8px;
+            padding: 6px;
         }
         """
         css_provider.load_from_data(css)
@@ -2468,16 +3334,22 @@ class MainWindow(Gtk.Window):
         sub_ids = {s.get("id") for s in subs}
 
         if self.current_search_channels:
-            lbl_chan = Gtk.Label()
-            lbl_chan.set_markup("<b>KÊNH PHÙ HỢP:</b>")
-            lbl_chan.set_xalign(0)
-            lbl_chan.get_style_context().add_class("section-header")
-            self.search_list.add(lbl_chan)
+            chan_frame = Gtk.Frame()
+            chan_frame.set_label(" KÊNH PHÙ HỢP NHẤT ")
+            chan_frame.get_style_context().add_class("featured-channel-frame")
+            chan_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            chan_vbox.set_margin_start(6)
+            chan_vbox.set_margin_end(6)
+            chan_vbox.set_margin_top(6)
+            chan_vbox.set_margin_bottom(6)
 
             for c in self.current_search_channels:
                 is_sub = c.get("id") in sub_ids
                 row = ChannelRow(c, self.open_channel_videos, self.toggle_channel_sub, is_sub)
-                self.search_list.add(row)
+                chan_vbox.pack_start(row, False, False, 0)
+
+            chan_frame.add(chan_vbox)
+            self.search_list.add(chan_frame)
 
         if self.current_search_results:
             if self.current_search_channels:
@@ -2909,7 +3781,7 @@ class MainWindow(Gtk.Window):
         def _add_thread():
             info = resolve_channel(target)
             if not info:
-                GLib.idle_add(self.set_status, "❌ Không tìm thấy kênh YouTube này!")
+                GLib.idle_add(self.set_status, "Không tìm thấy kênh YouTube này!")
                 return
             subs = load_subs()
             if any(s["id"] == info["id"] for s in subs):
@@ -2937,78 +3809,48 @@ class MainWindow(Gtk.Window):
 
     # ===================== 6. TAB CÀI ĐẶT =====================
     def _init_settings_tab(self):
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
-        vbox.set_margin_start(20)
-        vbox.set_margin_end(20)
-        vbox.set_margin_top(20)
-        vbox.set_margin_bottom(20)
+        vbox.set_margin_start(16)
+        vbox.set_margin_end(16)
+        vbox.set_margin_top(16)
+        vbox.set_margin_bottom(16)
 
-        grid = Gtk.Grid()
-        grid.set_column_spacing(20)
-        grid.set_row_spacing(14)
-        vbox.pack_start(grid, False, False, 0)
+        # -------------------------------------------------------------
+        # KHUNG 1: TRÌNH PHÁT VIDEO & VLC
+        # -------------------------------------------------------------
+        frame_vlc = Gtk.Frame()
+        frame_vlc.set_label(" 1. Trình phát Video & VLC ")
+        frame_vlc.get_style_context().add_class("settings-frame")
+        grid_vlc = Gtk.Grid()
+        grid_vlc.set_column_spacing(20)
+        grid_vlc.set_row_spacing(12)
+        grid_vlc.set_margin_start(14)
+        grid_vlc.set_margin_end(14)
+        grid_vlc.set_margin_top(12)
+        grid_vlc.set_margin_bottom(12)
 
-        row_i = 0
-
-        # 1. Chất lượng mặc định
+        r = 0
         lbl_q = Gtk.Label(label="Độ phân giải mặc định:", xalign=0)
         self.combo_quality = Gtk.ComboBoxText()
         for k, v in QUALITY_OPTIONS:
             self.combo_quality.append(k, v)
         self.combo_quality.set_active_id(self.settings.get("quality", "720"))
-        grid.attach(lbl_q, 0, row_i, 1, 1)
-        grid.attach(self.combo_quality, 1, row_i, 1, 1)
-        row_i += 1
+        grid_vlc.attach(lbl_q, 0, r, 1, 1)
+        grid_vlc.attach(self.combo_quality, 1, r, 1, 1)
 
-        # 2. Hỏi chất lượng trước khi phát
+        r += 1
         lbl_ask = Gtk.Label(label="Hỏi chất lượng trước khi phát:", xalign=0)
         self.switch_ask_quality = Gtk.Switch()
         self.switch_ask_quality.set_halign(Gtk.Align.START)
         self.switch_ask_quality.set_valign(Gtk.Align.CENTER)
         self.switch_ask_quality.set_active(self.settings.get("ask_quality", True))
-        grid.attach(lbl_ask, 0, row_i, 1, 1)
-        grid.attach(self.switch_ask_quality, 1, row_i, 1, 1)
-        row_i += 1
+        grid_vlc.attach(lbl_ask, 0, r, 1, 1)
+        grid_vlc.attach(self.switch_ask_quality, 1, r, 1, 1)
 
-        # 3. SponsorBlock
-        lbl_sb = Gtk.Label(label="SponsorBlock (Tự bỏ qua quảng cáo tài trợ):", xalign=0)
-        self.switch_sponsorblock = Gtk.Switch()
-        self.switch_sponsorblock.set_halign(Gtk.Align.START)
-        self.switch_sponsorblock.set_valign(Gtk.Align.CENTER)
-        self.switch_sponsorblock.set_active(self.settings.get("sponsorblock", True))
-        grid.attach(lbl_sb, 0, row_i, 1, 1)
-        grid.attach(self.switch_sponsorblock, 1, row_i, 1, 1)
-        row_i += 1
-
-        # 4. DeArrow
-        lbl_da = Gtk.Label(label="DeArrow (Tiêu đề & ảnh bìa sạch, chống câu view):", xalign=0)
-        self.switch_dearrow = Gtk.Switch()
-        self.switch_dearrow.set_halign(Gtk.Align.START)
-        self.switch_dearrow.set_valign(Gtk.Align.CENTER)
-        self.switch_dearrow.set_active(self.settings.get("dearrow", True))
-        grid.attach(lbl_da, 0, row_i, 1, 1)
-        grid.attach(self.switch_dearrow, 1, row_i, 1, 1)
-        row_i += 1
-
-        # 5. Tự động cuộn nạp thêm video (Infinite Scrolling)
-        lbl_inf = Gtk.Label(label="Tự động nạp thêm video khi cuộn xuống:", xalign=0)
-        self.switch_auto_load = Gtk.Switch()
-        self.switch_auto_load.set_halign(Gtk.Align.START)
-        self.switch_auto_load.set_valign(Gtk.Align.CENTER)
-        self.switch_auto_load.set_active(self.settings.get("auto_load_more", True))
-        grid.attach(lbl_inf, 0, row_i, 1, 1)
-        grid.attach(self.switch_auto_load, 1, row_i, 1, 1)
-        row_i += 1
-
-        # 6. Thư mục tải về
-        lbl_dl = Gtk.Label(label="Thư mục lưu video & audio tải về:", xalign=0)
-        self.entry_dl_dir = Gtk.Entry()
-        self.entry_dl_dir.set_text(self.settings.get("download_dir", os.path.expanduser("~/Downloads")))
-        grid.attach(lbl_dl, 0, row_i, 1, 1)
-        grid.attach(self.entry_dl_dir, 1, row_i, 1, 1)
-        row_i += 1
-
-        # 7. Bộ đệm VLC
+        r += 1
         lbl_c = Gtk.Label(label="Bộ nhớ đệm VLC (Caching):", xalign=0)
         self.combo_cache = Gtk.ComboBoxText()
         caches = [("1000", "1000 ms (Mạng cáp quang nhanh)"),
@@ -3018,18 +3860,26 @@ class MainWindow(Gtk.Window):
         for k, v in caches:
             self.combo_cache.append(k, v)
         self.combo_cache.set_active_id(str(self.settings.get("caching", 3000)))
-        grid.attach(lbl_c, 0, row_i, 1, 1)
-        grid.attach(self.combo_cache, 1, row_i, 1, 1)
-        row_i += 1
+        grid_vlc.attach(lbl_c, 0, r, 1, 1)
+        grid_vlc.attach(self.combo_cache, 1, r, 1, 1)
 
-        # 8. Player client (yt-dlp extractor)
+        r += 1
+        lbl_hw = Gtk.Label(label="Tăng tốc phần cứng (HW Accel S905X):", xalign=0)
+        self.switch_hw = Gtk.Switch()
+        self.switch_hw.set_halign(Gtk.Align.START)
+        self.switch_hw.set_valign(Gtk.Align.CENTER)
+        self.switch_hw.set_active(self.settings.get("hw_accel", True))
+        grid_vlc.attach(lbl_hw, 0, r, 1, 1)
+        grid_vlc.attach(self.switch_hw, 1, r, 1, 1)
+
+        r += 1
         lbl_pc = Gtk.Label(label="yt-dlp Player Client:", xalign=0)
         self.combo_player_client = Gtk.ComboBoxText()
         pc_options = [
-            ("tv_embedded,android,mweb", "tv_embedded + android + mweb (Khuyên dùng – chống 429)"),
+            ("tv_embedded,android,mweb", "tv_embedded + android + mweb (Khuyên dùng – chống bot 429)"),
             ("tv_embedded", "tv_embedded (TV – ổn định nhất)"),
             ("android,mweb", "android + mweb"),
-            ("ios,android,web", "ios + android + web (Cũ)"),
+            ("ios,android,web", "ios + android + web"),
             ("android", "android"),
         ]
         for k, v in pc_options:
@@ -3038,11 +3888,10 @@ class MainWindow(Gtk.Window):
             self.settings.get("player_client", "tv_embedded,android,mweb"))
         if self.combo_player_client.get_active_id() is None:
             self.combo_player_client.set_active(0)
-        grid.attach(lbl_pc, 0, row_i, 1, 1)
-        grid.attach(self.combo_player_client, 1, row_i, 1, 1)
-        row_i += 1
+        grid_vlc.attach(lbl_pc, 0, r, 1, 1)
+        grid_vlc.attach(self.combo_player_client, 1, r, 1, 1)
 
-        # 9. Spoof User-Agent
+        r += 1
         lbl_ua = Gtk.Label(label="Spoof User-Agent:", xalign=0)
         self.combo_ua = Gtk.ComboBoxText()
         for ua_name in UA_PRESETS:
@@ -3051,73 +3900,228 @@ class MainWindow(Gtk.Window):
         ua_keys = list(UA_PRESETS.keys())
         idx = ua_keys.index(current_ua) if current_ua in ua_keys else 0
         self.combo_ua.set_active(idx)
-        grid.attach(lbl_ua, 0, row_i, 1, 1)
-        grid.attach(self.combo_ua, 1, row_i, 1, 1)
-        row_i += 1
+        grid_vlc.attach(lbl_ua, 0, r, 1, 1)
+        grid_vlc.attach(self.combo_ua, 1, r, 1, 1)
 
-        # 10. Số lượng video tìm kiếm
+        frame_vlc.add(grid_vlc)
+        vbox.pack_start(frame_vlc, False, False, 0)
+
+        # -------------------------------------------------------------
+        # KHUNG 2: TIỆN ÍCH MỞ RỘNG & CHỐNG QUẢNG CÁO
+        # -------------------------------------------------------------
+        frame_ext = Gtk.Frame()
+        frame_ext.set_label(" 2. Tiện ích Mở Rộng & Chống Quảng Cáo ")
+        frame_ext.get_style_context().add_class("settings-frame")
+        grid_ext = Gtk.Grid()
+        grid_ext.set_column_spacing(20)
+        grid_ext.set_row_spacing(12)
+        grid_ext.set_margin_start(14)
+        grid_ext.set_margin_end(14)
+        grid_ext.set_margin_top(12)
+        grid_ext.set_margin_bottom(12)
+
+        r = 0
+        lbl_sb = Gtk.Label(label="SponsorBlock (Bỏ qua tài trợ & quảng cáo):", xalign=0)
+        self.switch_sponsorblock = Gtk.Switch()
+        self.switch_sponsorblock.set_halign(Gtk.Align.START)
+        self.switch_sponsorblock.set_valign(Gtk.Align.CENTER)
+        self.switch_sponsorblock.set_active(self.settings.get("sponsorblock", True))
+        grid_ext.attach(lbl_sb, 0, r, 1, 1)
+        grid_ext.attach(self.switch_sponsorblock, 1, r, 1, 1)
+
+        # Tùy chọn chi tiết từng danh mục SponsorBlock
+        r += 1
+        lbl_sb_cats = Gtk.Label()
+        lbl_sb_cats.set_markup("<span foreground='#5e9cf6'><b>• Tùy chọn phân đoạn SponsorBlock chi tiết:</b></span>")
+        lbl_sb_cats.set_xalign(0)
+        grid_ext.attach(lbl_sb_cats, 0, r, 2, 1)
+
+        sb_grid = Gtk.Grid()
+        sb_grid.set_column_spacing(16)
+        sb_grid.set_row_spacing(8)
+        sb_grid.set_margin_start(16)
+
+        sb_opts = [
+            ("sb_sponsor", "Phân đoạn nhà tài trợ (Sponsor)"),
+            ("sb_intro", "Nhạc / Cảnh mở đầu (Intro)"),
+            ("sb_outro", "Lời chào / Cảnh kết thúc (Outro)"),
+            ("sb_selfpromo", "Tự quảng cáo / Bán hàng (Self-promo)"),
+            ("sb_interaction", "Nhắc bấm thích & đăng ký (Interaction)"),
+            ("sb_preview", "Tóm tắt / Xem trước nội dung (Preview)")
+        ]
+        self.sb_switches = {}
+        for s_idx, (s_key, s_label) in enumerate(sb_opts):
+            s_lbl = Gtk.Label(label=f"- {s_label}:", xalign=0)
+            sw = Gtk.Switch()
+            sw.set_halign(Gtk.Align.START)
+            sw.set_valign(Gtk.Align.CENTER)
+            sw.set_active(self.settings.get(s_key, True))
+            self.sb_switches[s_key] = sw
+            col = (s_idx % 2) * 2
+            row_s = s_idx // 2
+            sb_grid.attach(s_lbl, col, row_s, 1, 1)
+            sb_grid.attach(sw, col + 1, row_s, 1, 1)
+
+        r += 1
+        grid_ext.attach(sb_grid, 0, r, 2, 1)
+
+        r += 1
+        lbl_da = Gtk.Label(label="DeArrow (Tiêu đề & ảnh bìa sạch, chống giật gân):", xalign=0)
+        self.switch_dearrow = Gtk.Switch()
+        self.switch_dearrow.set_halign(Gtk.Align.START)
+        self.switch_dearrow.set_valign(Gtk.Align.CENTER)
+        self.switch_dearrow.set_active(self.settings.get("dearrow", True))
+        grid_ext.attach(lbl_da, 0, r, 1, 1)
+        grid_ext.attach(self.switch_dearrow, 1, r, 1, 1)
+
+        r += 1
+        lbl_dislike = Gtk.Label(label="Return YouTube Dislike (Hiển thị lượt dislike chính xác):", xalign=0)
+        self.switch_return_dislike = Gtk.Switch()
+        self.switch_return_dislike.set_halign(Gtk.Align.START)
+        self.switch_return_dislike.set_valign(Gtk.Align.CENTER)
+        self.switch_return_dislike.set_active(self.settings.get("return_youtube_dislike", True))
+        grid_ext.attach(lbl_dislike, 0, r, 1, 1)
+        grid_ext.attach(self.switch_return_dislike, 1, r, 1, 1)
+
+        frame_ext.add(grid_ext)
+        vbox.pack_start(frame_ext, False, False, 0)
+
+        # -------------------------------------------------------------
+        # KHUNG 3: GIAO DIỆN & TRẢI NGHIỆM
+        # -------------------------------------------------------------
+        frame_ui = Gtk.Frame()
+        frame_ui.set_label(" 3. Giao diện & Trải nghiệm ")
+        frame_ui.get_style_context().add_class("settings-frame")
+        grid_ui = Gtk.Grid()
+        grid_ui.set_column_spacing(20)
+        grid_ui.set_row_spacing(12)
+        grid_ui.set_margin_start(14)
+        grid_ui.set_margin_end(14)
+        grid_ui.set_margin_top(12)
+        grid_ui.set_margin_bottom(12)
+
+        r = 0
+        lbl_dark = Gtk.Label(label="Giao diện tối (Dark Mode):", xalign=0)
+        self.switch_dark = Gtk.Switch()
+        self.switch_dark.set_halign(Gtk.Align.START)
+        self.switch_dark.set_valign(Gtk.Align.CENTER)
+        self.switch_dark.set_active(self.settings.get("dark_mode", True))
+        grid_ui.attach(lbl_dark, 0, r, 1, 1)
+        grid_ui.attach(self.switch_dark, 1, r, 1, 1)
+
+        r += 1
+        lbl_inf = Gtk.Label(label="Tự động nạp thêm video khi cuộn xuống (Infinite Scroll):", xalign=0)
+        self.switch_auto_load = Gtk.Switch()
+        self.switch_auto_load.set_halign(Gtk.Align.START)
+        self.switch_auto_load.set_valign(Gtk.Align.CENTER)
+        self.switch_auto_load.set_active(self.settings.get("auto_load_more", True))
+        grid_ui.attach(lbl_inf, 0, r, 1, 1)
+        grid_ui.attach(self.switch_auto_load, 1, r, 1, 1)
+
+        r += 1
         lbl_res = Gtk.Label(label="Số video tải mỗi lần tìm kiếm:", xalign=0)
         self.combo_max_res = Gtk.ComboBoxText()
         for k, v in [("20", "20 video"), ("30", "30 video (Khuyên dùng)"),
                      ("50", "50 video"), ("80", "80 video")]:
             self.combo_max_res.append(k, v)
         self.combo_max_res.set_active_id(str(self.settings.get("max_results", 30)))
-        grid.attach(lbl_res, 0, row_i, 1, 1)
-        grid.attach(self.combo_max_res, 1, row_i, 1, 1)
-        row_i += 1
+        grid_ui.attach(lbl_res, 0, r, 1, 1)
+        grid_ui.attach(self.combo_max_res, 1, r, 1, 1)
 
-        # 11. Tăng tốc phần cứng
-        lbl_hw = Gtk.Label(label="Tăng tốc phần cứng (HW Accel):", xalign=0)
-        self.switch_hw = Gtk.Switch()
-        self.switch_hw.set_halign(Gtk.Align.START)
-        self.switch_hw.set_valign(Gtk.Align.CENTER)
-        self.switch_hw.set_active(self.settings.get("hw_accel", True))
-        grid.attach(lbl_hw, 0, row_i, 1, 1)
-        grid.attach(self.switch_hw, 1, row_i, 1, 1)
-        row_i += 1
+        frame_ui.add(grid_ui)
+        vbox.pack_start(frame_ui, False, False, 0)
 
-        # 12. Giao diện tối
-        lbl_dark = Gtk.Label(label="Giao diện tối (Dark Mode):", xalign=0)
-        self.switch_dark = Gtk.Switch()
-        self.switch_dark.set_halign(Gtk.Align.START)
-        self.switch_dark.set_valign(Gtk.Align.CENTER)
-        self.switch_dark.set_active(self.settings.get("dark_mode", True))
-        grid.attach(lbl_dark, 0, row_i, 1, 1)
-        grid.attach(self.switch_dark, 1, row_i, 1, 1)
-        row_i += 1
+        # -------------------------------------------------------------
+        # KHUNG 4: LƯU TRỮ & DỮ LIỆU BỘ NHỚ ĐỆM
+        # -------------------------------------------------------------
+        frame_store = Gtk.Frame()
+        frame_store.set_label(" 4. Lưu trữ & Dữ liệu bộ nhớ đệm ")
+        frame_store.get_style_context().add_class("settings-frame")
+        grid_store = Gtk.Grid()
+        grid_store.set_column_spacing(16)
+        grid_store.set_row_spacing(12)
+        grid_store.set_margin_start(14)
+        grid_store.set_margin_end(14)
+        grid_store.set_margin_top(12)
+        grid_store.set_margin_bottom(12)
 
-        # Nút lưu & Thao tác
-        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        btn_save = create_icon_button("document-save-symbolic", "Lưu cài đặt", css_class="suggested-action")
-        btn_save.connect("clicked", lambda b: self.do_save_settings())
-        btn_box.pack_start(btn_save, False, False, 0)
+        r = 0
+        lbl_dl = Gtk.Label(label="Thư mục lưu video tải về:", xalign=0)
+        dl_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.entry_dl_dir = Gtk.Entry()
+        self.entry_dl_dir.set_text(self.settings.get("download_dir", os.path.expanduser("~/Downloads")))
+        dl_box.pack_start(self.entry_dl_dir, True, True, 0)
+        btn_browse = create_icon_button("folder-open-symbolic", "Chọn thư mục")
+        btn_browse.connect("clicked", self._choose_download_dir)
+        dl_box.pack_start(btn_browse, False, False, 0)
+        grid_store.attach(lbl_dl, 0, r, 1, 1)
+        grid_store.attach(dl_box, 1, r, 1, 1)
+
+        r += 1
+        maint_lbl = Gtk.Label(label="Thao tác hệ thống:", xalign=0)
+        maint_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        btn_clean_cache = create_icon_button("edit-clear-symbolic", "Dọn cache ảnh")
+        btn_clean_cache.connect("clicked", lambda b: self.do_clean_cache())
+        maint_box.pack_start(btn_clean_cache, False, False, 0)
 
         btn_prof = create_icon_button("user-available-symbolic", "Quản lý Người dùng")
         btn_prof.connect("clicked", lambda b: self.open_profile_dialog())
-        btn_box.pack_start(btn_prof, False, False, 0)
+        maint_box.pack_start(btn_prof, False, False, 0)
 
-        btn_clean_cache = create_icon_button("edit-clear-symbolic", "Dọn cache ảnh")
-        btn_clean_cache.connect("clicked", lambda b: self.do_clean_cache())
-        btn_box.pack_start(btn_clean_cache, False, False, 0)
+        grid_store.attach(maint_lbl, 0, r, 1, 1)
+        grid_store.attach(maint_box, 1, r, 1, 1)
 
-        vbox.pack_start(btn_box, False, False, 0)
+        frame_store.add(grid_store)
+        vbox.pack_start(frame_store, False, False, 0)
+
+        # -------------------------------------------------------------
+        # NÚT LƯU CÀI ĐẶT
+        # -------------------------------------------------------------
+        save_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        btn_save = create_icon_button("document-save-symbolic", "Lưu cài đặt", css_class="suggested-action")
+        btn_save.connect("clicked", lambda b: self.do_save_settings())
+        save_box.pack_start(btn_save, False, False, 0)
+        vbox.pack_start(save_box, False, False, 4)
 
         about_lbl = Gtk.Label()
         about_lbl.set_markup(
             "<small>Dự án mã nguồn mở phát triển bởi <b>starfish367</b>\n"
-            "Phiên bản: 3.0.0 (GTK3 VLC Edition – Tối ưu Armbian S905X)</small>"
+            "Phiên bản: 3.1.0 (GTK3 VLC Edition – Tối ưu Armbian S905X)</small>"
         )
         about_lbl.set_line_wrap(True)
         about_lbl.set_xalign(0)
-        vbox.pack_end(about_lbl, False, False, 10)
+        vbox.pack_start(about_lbl, False, False, 6)
 
-        self.notebook.append_page(vbox, create_tab_label("preferences-system-symbolic", "Cài đặt"))
+        scroll.add(vbox)
+        self.notebook.append_page(scroll, create_tab_label("preferences-system-symbolic", "Cài đặt"))
+
+    def _choose_download_dir(self, btn):
+        dialog = Gtk.FileChooserDialog(
+            title="Chọn thư mục tải về",
+            parent=self,
+            action=Gtk.FileChooserAction.SELECT_FOLDER
+        )
+        dialog.add_buttons(
+            "Hủy", Gtk.ResponseType.CANCEL,
+            "Chọn", Gtk.ResponseType.OK
+        )
+        current = self.entry_dl_dir.get_text().strip()
+        if os.path.exists(current):
+            dialog.set_current_folder(current)
+        if dialog.run() == Gtk.ResponseType.OK:
+            selected = dialog.get_filename()
+            if selected:
+                self.entry_dl_dir.set_text(selected)
+        dialog.destroy()
 
     def do_save_settings(self):
         self.settings["quality"] = self.combo_quality.get_active_id() or "720"
         self.settings["ask_quality"] = self.switch_ask_quality.get_active()
         self.settings["sponsorblock"] = self.switch_sponsorblock.get_active()
+        for k, sw in getattr(self, "sb_switches", {}).items():
+            self.settings[k] = sw.get_active()
         self.settings["dearrow"] = self.switch_dearrow.get_active()
+        self.settings["return_youtube_dislike"] = self.switch_return_dislike.get_active()
         self.settings["auto_load_more"] = self.switch_auto_load.get_active()
         self.settings["download_dir"] = self.entry_dl_dir.get_text().strip() or os.path.expanduser("~/Downloads")
         self.settings["caching"] = int(self.combo_cache.get_active_id() or 3000)
