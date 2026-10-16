@@ -29,6 +29,7 @@ import socket
 import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
+import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 
 import gi
@@ -602,6 +603,7 @@ def fetch_video_details_fast(video_id):
             res = {
                 "title": info.get("title", ""),
                 "channel": info.get("channel") or info.get("uploader", ""),
+                "channel_id": info.get("channel_id") or info.get("uploader_id", ""),
                 "description": info.get("description", ""),
                 "duration": info.get("duration"),
                 "view_count": info.get("view_count"),
@@ -1509,8 +1511,8 @@ def fetch_channel_videos_web(channel_id):
     return fetch_channel_tab_data(channel_id, tab_type="videos")
 
 
-def search_youtube_fast(query, limit=30):
-    """Tìm kiếm YouTube siêu nhanh: trả về cả Kênh và Video."""
+def search_youtube_fast(query, limit=30, search_type="all"):
+    """Tìm kiếm YouTube siêu nhanh: trả về cả Kênh và Video với hỗ trợ lọc loại tìm kiếm."""
     query = query.strip()
     if not query:
         return {"channels": [], "videos": []}
@@ -1526,142 +1528,232 @@ def search_youtube_fast(query, limit=30):
             channels.append(direct_chan)
             existing_chan_ids.add(direct_chan["id"])
 
-    try:
-        url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
-        req = urllib.request.Request(url, headers={
-            "User-Agent": UA_PRESETS["Firefox Desktop (Linux)"],
-            "Accept-Language": "vi,en;q=0.9"
-        })
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-        m = re.search(r"ytInitialData\s*=\s*({.+?});</script>", html) or \
-            re.search(r"var ytInitialData\s*=\s*({.+?});", html)
-        if m:
-            data = json.loads(m.group(1))
-            contents = (data['contents']['twoColumnSearchResultsRenderer']
-                        ['primaryContents']['sectionListRenderer']['contents'])
-            for section in contents:
-                for item in section.get('itemSectionRenderer', {}).get('contents', []):
-                    if 'channelRenderer' in item:
-                        cr = item['channelRenderer']
-                        cid = cr.get('channelId')
-                        if cid and cid not in existing_chan_ids:
-                            title = cr.get('title', {}).get('simpleText') or ''.join(
-                                r.get('text', '') for r in cr.get('title', {}).get('runs', [])
-                            )
-                            handle = cr.get('subscriberCountText', {}).get('simpleText', '')
-                            if not handle or not handle.startswith('@'):
-                                nav_url = cr.get('navigationEndpoint', {}).get(
-                                    'browseEndpoint', {}).get('canonicalBaseUrl', '')
-                                if nav_url.startswith('/@'):
-                                    handle = nav_url[1:]
-                            subs = cr.get('videoCountText', {}).get('simpleText') or cr.get(
-                                'subscriberCountText', {}).get('simpleText', '')
-                            desc = ''.join(r.get('text', '') for r in cr.get('descriptionSnippet', {}).get('runs', []))
-                            thumbs = cr.get('thumbnail', {}).get('thumbnails', [])
-                            avatar = thumbs[-1]['url'] if thumbs else None
-                            if avatar and avatar.startswith('//'):
-                                avatar = 'https:' + avatar
-                            is_verified = bool(cr.get('ownerBadges'))
+    headers = {
+        "User-Agent": UA_PRESETS["Firefox Desktop (Linux)"],
+        "Accept-Language": "vi,en;q=0.9"
+    }
 
-                            channels.append({
-                                'id': cid,
-                                'title': title or 'Kênh YouTube',
-                                'name': title or 'Kênh YouTube',
-                                'handle': handle,
-                                'subscribers': subs,
-                                'description': desc,
-                                'avatar': avatar,
-                                'verified': is_verified,
-                                'type': 'channel'
-                            })
-                            existing_chan_ids.add(cid)
+    def _fetch_channels():
+        chans = []
+        try:
+            url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}&sp=EgIQAg%253D%253D"
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=7) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+            m = re.search(r"ytInitialData\s*=\s*({.+?});</script>", html) or \
+                re.search(r"var ytInitialData\s*=\s*({.+?});", html)
+            if m:
+                data = json.loads(m.group(1))
+                contents = (data['contents']['twoColumnSearchResultsRenderer']
+                            ['primaryContents']['sectionListRenderer']['contents'])
+                for section in contents:
+                    for item in section.get('itemSectionRenderer', {}).get('contents', []):
+                        if 'channelRenderer' in item:
+                            cr = item['channelRenderer']
+                            cid = cr.get('channelId')
+                            if cid and cid not in existing_chan_ids:
+                                title = cr.get('title', {}).get('simpleText') or ''.join(
+                                    r.get('text', '') for r in cr.get('title', {}).get('runs', [])
+                                )
+                                handle = cr.get('subscriberCountText', {}).get('simpleText', '')
+                                if not handle or not handle.startswith('@'):
+                                    nav_url = cr.get('navigationEndpoint', {}).get(
+                                        'browseEndpoint', {}).get('canonicalBaseUrl', '')
+                                    if nav_url.startswith('/@'):
+                                        handle = nav_url[1:]
+                                subs = cr.get('videoCountText', {}).get('simpleText') or cr.get(
+                                    'subscriberCountText', {}).get('simpleText', '')
+                                desc = ''.join(r.get('text', '') for r in cr.get('descriptionSnippet', {}).get('runs', []))
+                                thumbs = cr.get('thumbnail', {}).get('thumbnails', [])
+                                avatar = thumbs[-1]['url'] if thumbs else None
+                                if avatar and avatar.startswith('//'):
+                                    avatar = 'https:' + avatar
+                                is_verified = bool(cr.get('ownerBadges'))
 
-                    elif 'videoRenderer' in item:
-                        v = item['videoRenderer']
-                        vid_id = v.get('videoId')
-                        if vid_id and vid_id not in existing_vid_ids:
-                            title = ''.join(r.get('text', '') for r in v.get('title', {}).get('runs', []))
-                            dur = v.get('lengthText', {}).get('simpleText', '--:--')
-                            owner_runs = v.get('ownerText', {}).get('runs', [])
-                            uploader = ''.join(r.get('text', '') for r in owner_runs) or 'YouTube'
-                            cid = None
-                            if owner_runs and 'navigationEndpoint' in owner_runs[0]:
-                                cid = owner_runs[0]['navigationEndpoint'].get('browseEndpoint', {}).get('browseId')
-                            chan_thumb = v.get('channelThumbnailSupportedRenderers', {}).get(
-                                'channelThumbnailWithLinkRenderer', {}).get('thumbnail', {}).get('thumbnails', [])
-                            chan_avatar = chan_thumb[-1]['url'] if chan_thumb else None
-                            if chan_avatar and chan_avatar.startswith('//'):
-                                chan_avatar = 'https:' + chan_avatar
+                                chans.append({
+                                    'id': cid,
+                                    'title': title or 'Kênh YouTube',
+                                    'name': title or 'Kênh YouTube',
+                                    'handle': handle,
+                                    'subscribers': subs,
+                                    'description': desc,
+                                    'avatar': avatar,
+                                    'verified': is_verified,
+                                    'type': 'channel'
+                                })
+                                existing_chan_ids.add(cid)
+                                if search_type == "all" and len(chans) >= 5:
+                                    break
+        except Exception:
+            pass
+        return chans
 
-                            pub = v.get('publishedTimeText', {}).get('simpleText', '')
-                            views = v.get('viewCountText', {}).get('simpleText', '')
-                            is_short = ('#shorts' in title.lower() or (':' in dur and len(dur.split(':')) == 2 and dur.replace(':', '').isdigit() and int(dur.split(':')[0]) * 60 + int(dur.split(':')[1]) <= 60))
+    def _fetch_main():
+        m_chans = []
+        m_vids = []
+        try:
+            url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+            m = re.search(r"ytInitialData\s*=\s*({.+?});</script>", html) or \
+                re.search(r"var ytInitialData\s*=\s*({.+?});", html)
+            if m:
+                data = json.loads(m.group(1))
+                contents = (data['contents']['twoColumnSearchResultsRenderer']
+                            ['primaryContents']['sectionListRenderer']['contents'])
+                for section in contents:
+                    for item in section.get('itemSectionRenderer', {}).get('contents', []):
+                        if 'channelRenderer' in item and search_type != "video":
+                            cr = item['channelRenderer']
+                            cid = cr.get('channelId')
+                            if cid and cid not in existing_chan_ids:
+                                title = cr.get('title', {}).get('simpleText') or ''.join(
+                                    r.get('text', '') for r in cr.get('title', {}).get('runs', [])
+                                )
+                                handle = cr.get('subscriberCountText', {}).get('simpleText', '')
+                                if not handle or not handle.startswith('@'):
+                                    nav_url = cr.get('navigationEndpoint', {}).get(
+                                        'browseEndpoint', {}).get('canonicalBaseUrl', '')
+                                    if nav_url.startswith('/@'):
+                                        handle = nav_url[1:]
+                                subs = cr.get('videoCountText', {}).get('simpleText') or cr.get(
+                                    'subscriberCountText', {}).get('simpleText', '')
+                                desc = ''.join(r.get('text', '') for r in cr.get('descriptionSnippet', {}).get('runs', []))
+                                thumbs = cr.get('thumbnail', {}).get('thumbnails', [])
+                                avatar = thumbs[-1]['url'] if thumbs else None
+                                if avatar and avatar.startswith('//'):
+                                    avatar = 'https:' + avatar
+                                is_verified = bool(cr.get('ownerBadges'))
 
-                            videos.append({
-                                'id': vid_id,
-                                'title': title,
-                                'uploader': uploader,
-                                'channel': uploader,
-                                'channel_id': cid,
-                                'channel_avatar': chan_avatar,
-                                'duration': 'Shorts' if is_short and dur == '--:--' else dur,
-                                'published': pub,
-                                'views': views,
-                                'type': 'video',
-                                'is_short': is_short
-                            })
-                            existing_vid_ids.add(vid_id)
+                                m_chans.append({
+                                    'id': cid,
+                                    'title': title or 'Kênh YouTube',
+                                    'name': title or 'Kênh YouTube',
+                                    'handle': handle,
+                                    'subscribers': subs,
+                                    'description': desc,
+                                    'avatar': avatar,
+                                    'verified': is_verified,
+                                    'type': 'channel'
+                                })
+                                existing_chan_ids.add(cid)
 
-                    # Trích xuất Shorts từ kệ YouTube (gridShelfViewModel, reelShelfRenderer, v.v.)
-                    shorts_items = []
-                    if 'gridShelfViewModel' in item:
-                        shorts_items.extend(item['gridShelfViewModel'].get('contents', []))
-                    elif 'reelShelfRenderer' in item:
-                        shorts_items.extend(item['reelShelfRenderer'].get('items', []))
-                    elif 'richShelfRenderer' in item:
-                        shorts_items.extend(item['richShelfRenderer'].get('contents', []))
-                    elif 'shelfRenderer' in item:
-                        shorts_items.extend(item['shelfRenderer'].get('content', {}).get('verticalListRenderer', {}).get('items', []))
-                    elif 'shortsLockupViewModel' in item or 'reelItemRenderer' in item:
-                        shorts_items.append(item)
+                        elif 'videoRenderer' in item and search_type != "channel":
+                            v = item['videoRenderer']
+                            vid_id = v.get('videoId')
+                            if vid_id and vid_id not in existing_vid_ids:
+                                title = ''.join(r.get('text', '') for r in v.get('title', {}).get('runs', []))
+                                dur = v.get('lengthText', {}).get('simpleText', '--:--')
+                                owner_runs = v.get('ownerText', {}).get('runs', [])
+                                uploader = ''.join(r.get('text', '') for r in owner_runs) or 'YouTube'
+                                cid = None
+                                if owner_runs and 'navigationEndpoint' in owner_runs[0]:
+                                    cid = owner_runs[0]['navigationEndpoint'].get('browseEndpoint', {}).get('browseId')
+                                chan_thumb = v.get('channelThumbnailSupportedRenderers', {}).get(
+                                    'channelThumbnailWithLinkRenderer', {}).get('thumbnail', {}).get('thumbnails', [])
+                                chan_avatar = chan_thumb[-1]['url'] if chan_thumb else None
+                                if chan_avatar and chan_avatar.startswith('//'):
+                                    chan_avatar = 'https:' + chan_avatar
 
-                    for s_item in shorts_items:
-                        s_vid = None
-                        s_title = None
-                        s_views = ""
-                        if 'shortsLockupViewModel' in s_item:
-                            slvm = s_item['shortsLockupViewModel']
-                            s_vid = slvm.get('onTap', {}).get('innertubeCommand', {}).get('reelWatchEndpoint', {}).get('videoId')
-                            if not s_vid:
-                                s_vid = slvm.get('entityId', '').replace('shorts-shelf-item-', '')
-                            s_title = slvm.get('overlayMetadata', {}).get('primaryText', {}).get('content') or slvm.get('accessibilityText')
-                            s_views = slvm.get('overlayMetadata', {}).get('secondaryText', {}).get('content', '')
-                        elif 'reelItemRenderer' in s_item:
-                            rir = s_item['reelItemRenderer']
-                            s_vid = rir.get('videoId')
-                            s_title = rir.get('headline', {}).get('simpleText') or ''.join(r.get('text', '') for r in rir.get('headline', {}).get('runs', []))
-                            s_views = rir.get('viewCountText', {}).get('simpleText', '')
+                                pub = v.get('publishedTimeText', {}).get('simpleText', '')
+                                views = v.get('viewCountText', {}).get('simpleText', '')
+                                is_short = ('#shorts' in title.lower() or (':' in dur and len(dur.split(':')) == 2 and dur.replace(':', '').isdigit() and int(dur.split(':')[0]) * 60 + int(dur.split(':')[1]) <= 60))
 
-                        if s_vid and s_title and s_vid not in existing_vid_ids:
-                            videos.append({
-                                'id': s_vid,
-                                'title': s_title,
-                                'uploader': 'YouTube Shorts',
-                                'channel': 'YouTube Shorts',
-                                'channel_id': None,
-                                'duration': 'Shorts',
-                                'published': '',
-                                'views': s_views,
-                                'type': 'video',
-                                'is_short': True
-                            })
-                            existing_vid_ids.add(s_vid)
-    except Exception:
-        pass
+                                m_vids.append({
+                                    'id': vid_id,
+                                    'title': title,
+                                    'uploader': uploader,
+                                    'channel': uploader,
+                                    'channel_id': cid,
+                                    'channel_avatar': chan_avatar,
+                                    'duration': 'Shorts' if is_short and dur == '--:--' else dur,
+                                    'published': pub,
+                                    'views': views,
+                                    'type': 'video',
+                                    'is_short': is_short
+                                })
+                                existing_vid_ids.add(vid_id)
+
+                        # Trích xuất Shorts từ kệ YouTube (gridShelfViewModel, reelShelfRenderer, v.v.)
+                        if search_type != "channel":
+                            shorts_items = []
+                            if 'gridShelfViewModel' in item:
+                                shorts_items.extend(item['gridShelfViewModel'].get('contents', []))
+                            elif 'reelShelfRenderer' in item:
+                                shorts_items.extend(item['reelShelfRenderer'].get('items', []))
+                            elif 'richShelfRenderer' in item:
+                                shorts_items.extend(item['richShelfRenderer'].get('contents', []))
+                            elif 'shelfRenderer' in item:
+                                shorts_items.extend(item['shelfRenderer'].get('content', {}).get('verticalListRenderer', {}).get('items', []))
+                            elif 'shortsLockupViewModel' in item or 'reelItemRenderer' in item:
+                                shorts_items.append(item)
+
+                            for s_item in shorts_items:
+                                s_vid = None
+                                s_title = None
+                                s_views = ""
+                                if 'shortsLockupViewModel' in s_item:
+                                    slvm = s_item['shortsLockupViewModel']
+                                    s_vid = slvm.get('onTap', {}).get('innertubeCommand', {}).get('reelWatchEndpoint', {}).get('videoId')
+                                    if not s_vid:
+                                        s_vid = slvm.get('entityId', '').replace('shorts-shelf-item-', '')
+                                    s_title = slvm.get('overlayMetadata', {}).get('primaryText', {}).get('content') or slvm.get('accessibilityText')
+                                    s_views = slvm.get('overlayMetadata', {}).get('secondaryText', {}).get('content', '')
+                                elif 'reelItemRenderer' in s_item:
+                                    rir = s_item['reelItemRenderer']
+                                    s_vid = rir.get('videoId')
+                                    s_title = rir.get('headline', {}).get('simpleText') or ''.join(r.get('text', '') for r in rir.get('headline', {}).get('runs', []))
+                                    s_views = rir.get('viewCountText', {}).get('simpleText', '')
+
+                                if s_vid and s_title and s_vid not in existing_vid_ids:
+                                    m_vids.append({
+                                        'id': s_vid,
+                                        'title': s_title,
+                                        'uploader': 'Đang tải...',
+                                        'channel': 'Đang tải...',
+                                        'channel_id': None,
+                                        'duration': 'Shorts',
+                                        'published': '',
+                                        'views': s_views,
+                                        'type': 'video',
+                                        'is_short': True
+                                    })
+                                    existing_vid_ids.add(s_vid)
+        except Exception:
+            pass
+        return m_chans, m_vids
+
+    if search_type == "channel":
+        channels.extend(_fetch_channels())
+    elif search_type == "video":
+        _, vids = _fetch_main()
+        videos.extend(vids)
+    else:  # "all"
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            fut_main = executor.submit(_fetch_main)
+            fut_chan = executor.submit(_fetch_channels)
+            try:
+                m_chans, m_vids = fut_main.result()
+            except Exception:
+                m_chans, m_vids = [], []
+            try:
+                extra_chans = fut_chan.result()
+            except Exception:
+                extra_chans = []
+
+            for c in m_chans:
+                if c['id'] not in {x['id'] for x in channels}:
+                    channels.append(c)
+            for c in extra_chans:
+                if c['id'] not in {x['id'] for x in channels}:
+                    channels.append(c)
+                if len(channels) >= 5:
+                    break
+            videos.extend(m_vids)
 
     # yt-dlp fallback nếu web search không trả về kết quả
-    if not videos and not channels:
+    if not videos and not channels and search_type != "channel":
         env = os.environ.copy()
         env["PATH"] = f"/home/a/.local/bin:{env.get('PATH', '')}"
         cmd = [
@@ -2087,7 +2179,7 @@ class VideoRow(Gtk.ListBoxRow):
             chan_box.pack_start(chan_lbl, False, False, 0)
             chan_btn.add(chan_box)
             chan_btn.set_tooltip_text(f"Xem các video trong kênh {channel_name}")
-            chan_btn.connect("clicked", lambda b: self._handle_channel_click(channel_name, video.get("channel_id")))
+            chan_btn.connect("clicked", lambda b: self._handle_channel_click(self.video.get("channel") or channel_name, self.video.get("channel_id")))
             chan_btn.get_style_context().add_class("flat")
             info_box.pack_start(chan_btn, False, False, 0)
         else:
@@ -2110,6 +2202,26 @@ class VideoRow(Gtk.ListBoxRow):
             m_lbl.set_markup(f"<span foreground='#aaaaaa'>• {' • '.join(meta_items)}</span>")
             m_lbl.set_xalign(0)
             info_box.pack_start(m_lbl, False, False, 0)
+
+        # Tự động nạp tên kênh chính xác cho Shorts và video chưa rõ uploader
+        if vid_id and (video.get("is_short") or channel_name in ("Đang tải...", "YouTube Shorts", "YouTube", "")):
+            def _resolve_channel():
+                details = fetch_video_details_fast(vid_id)
+                if details and details.get("channel"):
+                    cname = details["channel"]
+                    cid = details.get("channel_id")
+                    self.video["channel"] = cname
+                    self.video["uploader"] = cname
+                    if cid:
+                        self.video["channel_id"] = cid
+                    def _apply_cname():
+                        if on_channel_click:
+                            chan_lbl.set_markup(f"<span foreground='#5e9cf6'><u>{GLib.markup_escape_text(cname)}</u></span>")
+                            chan_btn.set_tooltip_text(f"Xem các video trong kênh {cname}")
+                        else:
+                            chan_lbl.set_text(cname)
+                    GLib.idle_add(_apply_cname)
+            stats_executor.submit(_resolve_channel)
 
         # Thống kê Like & Dislike nạp bất đồng bộ (KHÔNG DÙNG EMOJI - Chống vỡ font Tofu)
         self.stats_lbl = Gtk.Label()
@@ -2228,10 +2340,10 @@ class VideoDetailDialog(Gtk.Dialog):
         chan_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         chan_info.set_valign(Gtk.Align.CENTER)
 
-        c_lbl = Gtk.Label()
-        c_lbl.set_markup(f"<b>{GLib.markup_escape_text(channel_name)}</b> <span foreground='#3ea6ff'>✔</span>")
-        c_lbl.set_xalign(0)
-        chan_info.pack_start(c_lbl, False, False, 0)
+        self.c_lbl = Gtk.Label()
+        self.c_lbl.set_markup(f"<b>{GLib.markup_escape_text(channel_name)}</b> <span foreground='#3ea6ff'>✔</span>")
+        self.c_lbl.set_xalign(0)
+        chan_info.pack_start(self.c_lbl, False, False, 0)
 
         dur = video.get("duration", "--:--")
         pub = video.get("published", "")
@@ -2246,7 +2358,7 @@ class VideoDetailDialog(Gtk.Dialog):
         if on_channel_click:
             btn_view_chan = create_icon_button("video-display-symbolic", "Xem kênh")
             btn_view_chan.set_valign(Gtk.Align.CENTER)
-            btn_view_chan.connect("clicked", lambda b: (self.response(Gtk.ResponseType.CLOSE), on_channel_click(video.get("channel_id"), channel_name)))
+            btn_view_chan.connect("clicked", lambda b: (self.response(Gtk.ResponseType.CLOSE), on_channel_click(self.video.get("channel_id"), self.video.get("channel") or channel_name)))
             chan_row.pack_end(btn_view_chan, False, False, 0)
 
         content.pack_start(chan_row, False, False, 0)
@@ -2358,8 +2470,19 @@ class VideoDetailDialog(Gtk.Dialog):
         else:
             GLib.idle_add(self.stats_lbl.set_markup, "<span foreground='#888888'>Không có dữ liệu like/dislike</span>")
 
-        # 2. Chi tiết mô tả video
+        # 2. Chi tiết mô tả video & kênh
         details = fetch_video_details_fast(self.vid_id)
+        if details:
+            cname = details.get("channel")
+            cid = details.get("channel_id")
+            if cname and (not self.video.get("channel") or self.video.get("channel") in ("YouTube Shorts", "YouTube", "Đang tải...")):
+                self.video["channel"] = cname
+                self.video["uploader"] = cname
+                if cid:
+                    self.video["channel_id"] = cid
+                def _update_cname():
+                    self.c_lbl.set_markup(f"<b>{GLib.markup_escape_text(cname)}</b> <span foreground='#3ea6ff'>✔</span>")
+                GLib.idle_add(_update_cname)
         desc = details.get("description", "").strip() or self.video.get("description", "").strip() or "Không có phần mô tả cho video này."
         GLib.idle_add(self.desc_lbl.set_text, desc)
 
@@ -2934,11 +3057,15 @@ class MainWindow(Gtk.Window):
         self.set_position(Gtk.WindowPosition.CENTER)
 
         self.settings = load_settings()
-        if self.settings.get("dark_mode", True):
-            Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", True)
+        self.css_provider = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            self.css_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+        self.apply_theme(self.settings.get("dark_mode", True))
 
         self._setup_icon()
-        self._setup_css()
 
         main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.add(main_vbox)
@@ -3032,70 +3159,186 @@ class MainWindow(Gtk.Window):
                 except Exception:
                     continue
 
-    def _setup_css(self):
-        css_provider = Gtk.CssProvider()
-        css = b"""
-        list row {
-            padding: 4px;
-            border-bottom: 1px solid rgba(128, 128, 128, 0.2);
-            border-radius: 6px;
-            margin: 2px 6px;
-        }
-        list row:hover {
-            background-color: rgba(255, 255, 255, 0.08);
-        }
-        .suggested-action {
-            padding: 6px 14px;
-            font-weight: bold;
-        }
-        .flat {
-            border: none;
-            background: none;
-            padding: 0px 4px;
-        }
-        .channel-card {
-            background-color: rgba(255, 255, 255, 0.05);
-            border: 1px solid rgba(255, 255, 255, 0.12);
-            border-radius: 8px;
-            padding: 8px 12px;
-            margin: 4px 6px;
-        }
-        .section-header {
-            padding: 8px 12px;
-            color: #3ea6ff;
-        }
-        .thumbnail-watched {
-            opacity: 0.35;
-        }
-        .video-progress-bar progress {
-            background-color: #ff0000;
-            min-height: 4px;
-            border-radius: 0px;
-        }
-        .video-progress-bar trough {
-            background-color: rgba(255, 255, 255, 0.3);
-            min-height: 4px;
-            border-radius: 0px;
-        }
-        .featured-channel-frame {
-            border: 2px solid #3ea6ff;
-            border-radius: 8px;
-            margin: 6px 4px;
-            padding: 4px;
-            background-color: rgba(62, 166, 255, 0.06);
-        }
-        .settings-frame {
-            margin-bottom: 12px;
-            border-radius: 8px;
-            padding: 6px;
-        }
-        """
-        css_provider.load_from_data(css)
-        Gtk.StyleContext.add_provider_for_screen(
-            Gdk.Screen.get_default(),
-            css_provider,
-            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-        )
+    def apply_theme(self, is_dark=True):
+        """Áp dụng chủ đề giao diện đồng bộ KDE Plasma 6 (Breeze / Breeze-Dark) và True Dark Mode."""
+        theme_name = "Breeze-Dark" if is_dark else "Breeze"
+        gtk_settings = Gtk.Settings.get_default()
+        if gtk_settings:
+            gtk_settings.set_property("gtk-theme-name", theme_name)
+            gtk_settings.set_property("gtk-application-prefer-dark-theme", is_dark)
+
+        if is_dark:
+            css = b"""
+            window, dialog {
+                background-color: #232629;
+                color: #eff0f1;
+            }
+            headerbar {
+                background-color: #2a2e32;
+                color: #eff0f1;
+                border-bottom: 1px solid #31363b;
+            }
+            list, treeview, scrolledwindow > viewport {
+                background-color: #1b1e20;
+                color: #eff0f1;
+            }
+            list row {
+                padding: 6px 8px;
+                border-bottom: 1px solid #31363b;
+                border-radius: 6px;
+                margin: 2px 4px;
+                background-color: #232629;
+            }
+            list row:hover {
+                background-color: #2e343a;
+            }
+            list row:selected {
+                background-color: #3daee9;
+                color: #ffffff;
+            }
+            .suggested-action {
+                background-color: #3daee9;
+                color: #ffffff;
+                border: 1px solid #2980b9;
+                border-radius: 4px;
+                padding: 6px 14px;
+                font-weight: bold;
+            }
+            .suggested-action:hover {
+                background-color: #4dc2ff;
+            }
+            .flat {
+                border: none;
+                background: none;
+                padding: 0px 4px;
+            }
+            .channel-card {
+                background-color: #2a2e32;
+                border: 1px solid #3e444a;
+                border-radius: 6px;
+                padding: 8px 12px;
+                margin: 4px 6px;
+            }
+            .section-header {
+                padding: 6px 10px;
+                color: #3daee9;
+                font-weight: bold;
+            }
+            .thumbnail-watched {
+                opacity: 0.35;
+            }
+            .video-progress-bar progress {
+                background-color: #da4453;
+                min-height: 4px;
+                border-radius: 0px;
+            }
+            .video-progress-bar trough {
+                background-color: #31363b;
+                min-height: 4px;
+                border-radius: 0px;
+            }
+            .featured-channel-frame {
+                border: 1px solid #3daee9;
+                border-radius: 6px;
+                margin: 6px 4px;
+                padding: 6px;
+                background-color: rgba(61, 174, 233, 0.08);
+            }
+            .settings-frame {
+                margin-bottom: 12px;
+                border: 1px solid #3e444a;
+                border-radius: 6px;
+                padding: 8px;
+                background-color: #2a2e32;
+            }
+            """
+        else:
+            css = b"""
+            window, dialog {
+                background-color: #eff0f1;
+                color: #232629;
+            }
+            headerbar {
+                background-color: #e3e5e7;
+                color: #232629;
+                border-bottom: 1px solid #d3d7cf;
+            }
+            list, treeview, scrolledwindow > viewport {
+                background-color: #fcfcfc;
+                color: #232629;
+            }
+            list row {
+                padding: 6px 8px;
+                border-bottom: 1px solid #e0e0e0;
+                border-radius: 6px;
+                margin: 2px 4px;
+                background-color: #ffffff;
+            }
+            list row:hover {
+                background-color: #ebf3fb;
+            }
+            list row:selected {
+                background-color: #3daee9;
+                color: #ffffff;
+            }
+            .suggested-action {
+                background-color: #3daee9;
+                color: #ffffff;
+                border: 1px solid #2980b9;
+                border-radius: 4px;
+                padding: 6px 14px;
+                font-weight: bold;
+            }
+            .suggested-action:hover {
+                background-color: #4dc2ff;
+            }
+            .flat {
+                border: none;
+                background: none;
+                padding: 0px 4px;
+            }
+            .channel-card {
+                background-color: #f5f5f5;
+                border: 1px solid #dcdcdc;
+                border-radius: 6px;
+                padding: 8px 12px;
+                margin: 4px 6px;
+            }
+            .section-header {
+                padding: 6px 10px;
+                color: #1d72b8;
+                font-weight: bold;
+            }
+            .thumbnail-watched {
+                opacity: 0.35;
+            }
+            .video-progress-bar progress {
+                background-color: #da4453;
+                min-height: 4px;
+                border-radius: 0px;
+            }
+            .video-progress-bar trough {
+                background-color: #dcdcdc;
+                min-height: 4px;
+                border-radius: 0px;
+            }
+            .featured-channel-frame {
+                border: 1px solid #3daee9;
+                border-radius: 6px;
+                margin: 6px 4px;
+                padding: 6px;
+                background-color: rgba(61, 174, 233, 0.08);
+            }
+            .settings-frame {
+                margin-bottom: 12px;
+                border: 1px solid #dcdcdc;
+                border-radius: 6px;
+                padding: 8px;
+                background-color: #f8f9fa;
+            }
+            """
+        if hasattr(self, "css_provider") and self.css_provider:
+            self.css_provider.load_from_data(css)
 
     def set_status(self, text):
         self.status_bar.pop(self.status_context)
@@ -3230,6 +3473,16 @@ class MainWindow(Gtk.Window):
         self.search_sort_combo.connect("changed", lambda c: self._resort_search())
         search_box.pack_start(self.search_sort_combo, False, False, 0)
 
+        type_lbl = Gtk.Label(label="Loại:")
+        search_box.pack_start(type_lbl, False, False, 0)
+        self.search_type_combo = Gtk.ComboBoxText()
+        self.search_type_combo.append("all", "Tất cả")
+        self.search_type_combo.append("video", "Video")
+        self.search_type_combo.append("channel", "Kênh")
+        self.search_type_combo.set_active_id("all")
+        self.search_type_combo.connect("changed", lambda c: self.do_search() if self.search_entry.get_text().strip() else None)
+        search_box.pack_start(self.search_type_combo, False, False, 0)
+
         self.search_spinner = Gtk.Spinner()
         search_box.pack_start(self.search_spinner, False, False, 0)
         vbox.pack_start(search_box, False, False, 0)
@@ -3288,9 +3541,10 @@ class MainWindow(Gtk.Window):
             self.search_list.remove(child)
 
         limit = self.settings.get("max_results", 30)
+        search_type = self.search_type_combo.get_active_id() or "all"
 
         def _search_thread():
-            results = search_youtube_fast(query, limit=limit)
+            results = search_youtube_fast(query, limit=limit, search_type=search_type)
             GLib.idle_add(self._render_search_results, results)
 
         threading.Thread(target=_search_thread, daemon=True).start()
@@ -3335,7 +3589,8 @@ class MainWindow(Gtk.Window):
 
         if self.current_search_channels:
             chan_frame = Gtk.Frame()
-            chan_frame.set_label(" KÊNH PHÙ HỢP NHẤT ")
+            chan_count = len(self.current_search_channels)
+            chan_frame.set_label(f" KÊNH PHÙ HỢP ({chan_count} kênh) " if chan_count > 1 else " KÊNH PHÙ HỢP ")
             chan_frame.get_style_context().add_class("featured-channel-frame")
             chan_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
             chan_vbox.set_margin_start(6)
@@ -3388,9 +3643,10 @@ class MainWindow(Gtk.Window):
 
         current_count = len(self.current_search_results)
         fetch_limit = current_count + self.settings.get("max_results", 30)
+        search_type = self.search_type_combo.get_active_id() or "all"
 
         def _more_thread():
-            results = search_youtube_fast(self.current_search_query, limit=fetch_limit)
+            results = search_youtube_fast(self.current_search_query, limit=fetch_limit, search_type=search_type)
             GLib.idle_add(self._append_more_results, results)
 
         threading.Thread(target=_more_thread, daemon=True).start()
@@ -3399,6 +3655,13 @@ class MainWindow(Gtk.Window):
         self.is_search_loading_more = False
         self.load_more_spinner.stop()
         self.btn_load_more.set_sensitive(True)
+
+        new_channels = new_data.get("channels", []) if isinstance(new_data, dict) else []
+        existing_cids = {c['id'] for c in self.current_search_channels if c.get('id')}
+        for c in new_channels:
+            if c.get('id') and c['id'] not in existing_cids:
+                self.current_search_channels.append(c)
+                existing_cids.add(c['id'])
 
         new_videos = new_data.get("videos", []) if isinstance(new_data, dict) else new_data
         existing_ids = {r['id'] for r in self.current_search_results}
@@ -4131,10 +4394,8 @@ class MainWindow(Gtk.Window):
         self.settings["hw_accel"] = self.switch_hw.get_active()
         self.settings["dark_mode"] = self.switch_dark.get_active()
         save_settings(self.settings)
-        Gtk.Settings.get_default().set_property(
-            "gtk-application-prefer-dark-theme", self.settings["dark_mode"]
-        )
-        self.set_status("Đã lưu cài đặt thành công!")
+        self.apply_theme(self.settings["dark_mode"])
+        self.set_status("Đã lưu cài đặt và cập nhật giao diện thành công!")
 
     def do_clean_cache(self):
         count = 0
